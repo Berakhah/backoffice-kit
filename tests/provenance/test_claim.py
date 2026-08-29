@@ -65,6 +65,45 @@ def test_decimal_claim_serialises_as_string_never_float() -> None:
     assert isinstance(payload["value"], str)
 
 
+def test_decimal_claim_stays_a_real_decimal_in_python_mode_dump() -> None:
+    """I5's flip side. R1: the field_serializer originally ran on every mode
+    (`when_used="always"`, pydantic's default), so python-mode `model_dump()` silently
+    handed back a str where a caller reading `.value`'s declared type expects a Decimal.
+    Scoping the serializer to `when_used="json"` is what this test pins."""
+    c = Claim[Decimal](
+        value=Decimal("1234.50"), source=SRC, method=Method.DETERMINISTIC, observed_at=NOW
+    )
+    value = c.model_dump()["value"]
+    assert isinstance(value, Decimal)
+    assert value == Decimal("1234.50")
+
+
+def test_decimal_value_nested_in_parents_still_serialises_as_string() -> None:
+    """I5 holds through the unbound-T path too: a Decimal-valued parent claim, held in the
+    bare `parents: list[Claim]` field, must still come out of JSON as a string."""
+    parent = Claim[Decimal](
+        value=Decimal("9.99"), source=SRC, method=Method.DETERMINISTIC, observed_at=NOW
+    )
+    child = Claim[Decimal](
+        value=Decimal("1.00"),
+        source=SRC,
+        method=Method.DETERMINISTIC,
+        observed_at=NOW,
+        parents=[parent],
+    )
+    dumped = json.loads(child.model_dump_json())
+    assert dumped["parents"][0]["value"] == "9.99"
+    assert isinstance(dumped["parents"][0]["value"], str)
+
+
+def test_claim_is_frozen() -> None:
+    """A plain attribute assignment must not bypass I1/I3 after validation already ran.
+    R1: `det.confidence = 0.9` on a DETERMINISTIC claim worked silently before this."""
+    det = Claim[int](value=1, source=SRC, method=Method.DETERMINISTIC, observed_at=NOW)
+    with pytest.raises(ValidationError):
+        det.confidence = 0.9
+
+
 def test_derived_claim_inherits_unverified_ness_from_any_ancestor() -> None:
     """I7. R1: the single most consequential bug in the pre-revision plan.
 

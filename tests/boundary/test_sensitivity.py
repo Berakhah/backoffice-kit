@@ -1,3 +1,4 @@
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -38,9 +39,22 @@ def test_trust_is_independent_of_sensitivity() -> None:
 
 
 def test_repr_never_renders_the_payload() -> None:
-    r = repr(Labelled("acct 12345678", Sensitivity.CLIENT_CONFIDENTIAL))
+    labelled = Labelled("acct 12345678", Sensitivity.CLIENT_CONFIDENTIAL)
+    r = repr(labelled)
     assert "12345678" not in r
     assert "CLIENT_CONFIDENTIAL" in r
+    # R1: repr() alone is not the whole guard -- str() and an f-string both route through
+    # __str__, and a naive fix only overrides __repr__.
+    assert "12345678" not in str(labelled)
+    assert "12345678" not in f"{labelled}"
+
+
+def test_labelled_is_frozen() -> None:
+    """A plain attribute assignment must not be able to silently downgrade a
+    CLIENT_CONFIDENTIAL payload's sensitivity after construction."""
+    labelled = Labelled("x", Sensitivity.CLIENT_CONFIDENTIAL)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        labelled.sensitivity = Sensitivity.PUBLIC  # type: ignore[misc]
 
 
 def test_violation_carries_a_reason() -> None:

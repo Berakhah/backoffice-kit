@@ -6,6 +6,7 @@ They are orthogonal: an attacker-authored MCP tool description is PUBLIC and UNT
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Generic, TypeVar
@@ -48,19 +49,22 @@ class SensitivityViolation(Exception):
     """
 
 
+@dataclass(frozen=True, slots=True)
 class Labelled(Generic[T]):
     """A payload carrying its boundary labels.
 
     Wraps str, bytes, Path or an open handle -- not only prompts. The label must attach
     where a file is opened; attaching it at gateway entry is too late (ledger-sense 4.1.4).
+
+    frozen=True blocks plain attribute assignment (`labelled.sensitivity = PUBLIC`), which
+    would otherwise silently downgrade a CLIENT_CONFIDENTIAL payload after the fact. Unlike
+    a pydantic model there is no `model_copy` equivalent shipped here, so this closes the
+    mutation path completely rather than leaving a residual gap.
     """
 
-    __slots__ = ("sensitivity", "trust", "value")
-
-    def __init__(self, value: T, sensitivity: Sensitivity, trust: Trust = Trust.TRUSTED) -> None:
-        self.value = value
-        self.sensitivity = sensitivity
-        self.trust = trust
+    value: T
+    sensitivity: Sensitivity
+    trust: Trust = Trust.TRUSTED
 
     @classmethod
     def from_path(

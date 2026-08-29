@@ -16,7 +16,11 @@ dev = [
   "types-PyYAML>=6.0",   # R1: without this `mypy --strict` fails at Task 7 with
                          # 'Library stubs not installed for "yaml"'. Reproduced.
   "pip-audit>=2.7",      # R1: 00 section 8 requires dependency scanning. Was absent.
-  "cyclonedx-bom>=4.4",  # R1: 00 section 8 requires an SBOM per release. Was absent.
+  # cyclonedx-bom deliberately NOT included: it transitively pulls chardet (LGPL-2.1,
+  # a hard dependency) and fqdn (MPL-2.0, via jsonschema[format-nongpl]), both outside
+  # the MIT/Apache-2.0/BSD/OFL allowlist. SBOM generation is only needed at actual PyPI
+  # publish time, which is out of scope for this slice -- add it back, with a documented
+  # licence exception, when publishing becomes real.
 ]
 
 [build-system]

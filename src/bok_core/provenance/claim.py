@@ -48,7 +48,13 @@ class Calibration(BaseModel):
 
 
 class Claim(BaseModel, Generic[T]):
-    model_config = ConfigDict(extra="forbid")
+    # frozen=True blocks plain attribute assignment (`claim.confidence = 0.99`), which
+    # would otherwise let a caller silently violate I1/I3 after validation already passed.
+    # KNOWN GAP: this does not close `claim.model_copy(update={...})` -- pydantic builds
+    # the copy directly from the update dict without re-running validators, so the same
+    # invariant is still bypassable through model_copy. No enforcement exists for that path
+    # yet; closing it needs a custom copy method, out of scope for this slice.
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     value: T
     source: Source
@@ -67,9 +73,12 @@ class Claim(BaseModel, Generic[T]):
     parents: list[Claim] = []  # type: ignore[type-arg]
     caveat: str | None = None
 
-    @field_serializer("value")
+    @field_serializer("value", when_used="json")
     def _serialise_value(self, v: T) -> object:
-        # I5: a Decimal must never reach JSON as a float.
+        # I5: a Decimal must never reach JSON as a float. Scoped to JSON mode only --
+        # `when_used="always"` (the default) ran this in python-mode `model_dump()` too,
+        # silently replacing a real Decimal with its str() there, where callers expect
+        # the field's declared type back unchanged.
         return str(v) if isinstance(v, Decimal) else v
 
     @model_validator(mode="after")
