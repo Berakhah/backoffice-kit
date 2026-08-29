@@ -9,8 +9,15 @@ Week 0 · No accent of its own — it defines all four · Licence: Apache-2.0 (p
 
 - `../Starting_Documents/00-SHARED-FOUNDATION.md` — this repo **is** that document. Read it in full; it is the spec.
 - The four consumer briefs (`01`–`04`) describe what will be built on top. Read them for the interface requirements they impose, not for their own scope.
+- `docs/superpowers/specs/2026-08-27-backoffice-kit-design.md` — the approved design. It **amends `00` in several recorded places**; §1 is the decisions ledger and every amendment is argued there rather than assumed.
+- `docs/INTERFACE-CONTRACT.md` **v0.2** — the authoritative symbol surface. If a symbol is not in it, it does not exist, and the task needing it is blocked on an amendment there, not on a local workaround.
 
-The brief wins over anything summarised here. This file exists so a fresh session cannot violate a hard rule by accident.
+The brief wins over anything summarised here, **except where the design records an amendment to it** — then the design wins and says why. This file exists so a fresh session cannot violate a hard rule by accident; where it and the design disagree, the design is newer.
+
+> **Revision R1 (29 Aug 2026)** audited both implementation plans against all of the above. Five
+> controls were untestable-as-written or absent, and the plans were corrected in place. If you are
+> re-deriving any rule below from `00` alone, read the `R1:` notes in the plans first — several of
+> them exist because the obvious reading of `00` produced a test that could not fail.
 
 ## Workflow
 
@@ -24,10 +31,10 @@ superpowers, in order: `brainstorming` → `using-git-worktrees` → `writing-pl
 
 1. **No model name is ever hardcoded.** Selection lives in `models.yaml`, resolved at runtime through a lane abstraction (`extract-vision`, `judge`, `classify-cheap`, `local-fallback`). Code asks for a lane, never a model. (R1)
 2. **A dead primary is never discovered mid-run by a 429 or a 404.** Startup capability probe pings every configured model, records what is alive, demotes dead entries down the fallback chain, caches with a TTL, and exposes the result as a provider health strip. (R2)
-3. **Every capability has a deterministic implementation that carries the majority of the load;** the model is an escalation path. Rules before classifiers, OCR + layout before vision, DOM heuristics before visual grounding, exact-match graders before LLM judges. **If every provider went dark, ≥70% of each product's findings still generate** — and `test_degraded_mode_still_produces_findings` proves it. (R3)
+3. **Every capability has a deterministic implementation that carries the majority of the load;** the model is an escalation path. Rules before classifiers, OCR + layout before vision, DOM heuristics before visual grounding, exact-match graders before LLM judges. **There is no shared ≥70% threshold** — design §7 deletes it, because `00` §2.2 and §7 name two different denominators and the four consumers measure four incommensurable units. What is shared is `bok_core.testing.degraded`: a `blackout()` that patches the socket, and `assert_blackout_complete()`. Each repo declares and tests its own floor, in its own stated unit, and publishes it in `docs/methodology.md`. (R3)
 4. **`CLIENT_CONFIDENTIAL` never reaches a free tier — hard fail, `SensitivityViolation`.** Every payload crossing into the gateway carries a `Sensitivity` label: `PUBLIC` and `SYNTHETIC` may go anywhere; `REDACTED` only with an explicit per-project opt-in; `CLIENT_CONFIDENTIAL` routes only to a fully local path, or to a provider marked `trains_on_data: false` **and** `commercial_use: true` **and** with a client-supplied paid key. Enforced in code, not in discipline. **Build this before anything that touches a document.** (R4)
-5. **Redaction is verified, not hoped.** Rule-based detection (emails, phones, tax ids, bank/routing numbers, addresses, names via local NER), replacement with stable surrogates so structure survives, then **a verification pass that re-scans the output and fails loudly if any original identifier string still appears.** Untested redaction is worse than none — it manufactures false confidence in the boundary.
-6. **Quota fails closed.** Persistent token bucket per provider (RPM, TPM, RPD tracked separately), exponential backoff with full jitter on 429, priority-lane request queue, hard daily ceiling. Quota consumed is displayed as a first-class metric — in a $0 build, quota *is* the cost column. (R5)
+5. **Redaction is verified, not hoped.** Rule-based detection (emails, phones, tax ids, bank/routing numbers, addresses, names via local NER), replacement with **HMAC-keyed** stable surrogates so structure survives, then **a verification pass that RE-RUNS EVERY DETECTOR over the output** and fails loudly if any fires. Untested redaction is worse than none — it manufactures false confidence in the boundary. Three R1 corrections are load-bearing here: verification that re-searches for strings it just replaced is a tautology and cannot fail; an unkeyed `sha256(id)[:8]` surrogate is brute-forceable for the identifier classes that matter; and the result object must never carry the identifiers it removed. The classes that are *not* detected are declared, in `COVERED`/`NOT_COVERED` and in `methodology.md` — an undetected class is a hole, and naming it is what separates a limitation from a lie.
+6. **Quota fails closed — which means reserving BEFORE dispatch, not recording after.** Persistent per-provider buckets over **rolling** 60s/24h windows (a calendar-minute bucket permits double the ceiling across a minute boundary), one `BEGIN IMMEDIATE` spanning check-and-increment so two concurrent callers cannot both pass, exponential backoff with **full jitter, capped, and honouring `Retry-After`**, a priority-lane queue, and a hard daily ceiling. Quota consumed is displayed as a first-class metric — in a $0 build, quota *is* the cost column. (R5)
 7. **Every model call is recorded:** prompt hash, model actually used, provider, latency, tokens, quota consumed, timestamp, response fingerprint, sensitivity label, lane. This ledger is what makes Ground Truth possible at all and what makes the other three products' provenance claims true rather than aspirational. (R7)
 8. **No secrets in a repo, ever, including test fixtures.** `gitleaks` pre-commit and in CI.
 9. **No AGPL dependency adopted silently.** MIT / Apache-2.0 / BSD / OFL only for anything vendored or redistributed. Flag any AGPL candidate explicitly and name the permissive alternative.
@@ -48,10 +55,14 @@ class Claim(BaseModel, Generic[T]):
     caveat: str | None = None   # scope limitation, in the source's own terms
 ```
 
-Enforced by tests:
+Enforced by a validator on `Claim` itself, not by a helper a caller can route around:
 - A `DERIVED` claim's confidence never exceeds the minimum of its parents'.
 - A `MODEL` claim with `confidence is None` cannot render as a fact — the UI shows it as unverified.
-- `caveat` propagates to children. If a parent says "sample size 51", the child says it too.
+- **`DERIVED` inherits unverified-ness.** `renders_as_fact()` is False if *any* ancestor is an uncalibrated `MODEL` claim. Without this, one `derive()` hop launders a 0.72 model guess into a fact — and R1 found exactly that in the worked example `00` §10.4 makes a definition-of-done item.
+- `DETERMINISTIC` implies `confidence is None`. `Claim[Decimal]` serialises as a **string**, at every layer including the rail payload the UI consumes.
+- `caveat` propagates to children. If a parent says "sample size 51", the child says it too — over branching chains at depth ≥ 5, not just linear ones.
+
+`parents` is annotated `list[Claim]`, **bare**: a self-referencing parametrised field (`list[Claim[object]]`) raises `AttributeError: __pydantic_fields__` at `Claim[Decimal]` on pydantic 2.13. Verified, not inferred.
 
 This makes "state your scope" structural rather than a habit anyone has to remember.
 
@@ -68,7 +79,9 @@ bok_core/
 
 Route through a self-hosted **LiteLLM** proxy (MIT) or an equivalent thin adapter — one OpenAI-shaped interface, fallback chains, per-key budgets. Do **not** adopt a hosted gateway with a free tier of its own; that adds a second thing that can silently change.
 
-Response cache is content-addressed (hash of model + lane + normalised prompt + params), SQLite-backed, explicit TTL, with an invalidate command. On free tiers, cache hit rate is the difference between a demo that runs and one that 429s in front of a client. (R6)
+Response cache is content-addressed — **provider + model + lane + normalised prompt + canonical params + response-schema fingerprint** — SQLite-backed (WAL), explicit TTL, LRU-bounded, with an invalidate command taking a pattern. Drop the provider and you erase `ground-truth` B8; drop the params and a temperature change is a hit; drop the schema and a reply validated against schema A is returned for schema B. On free tiers, cache hit rate is the difference between a demo that runs and one that 429s in front of a client. (R6)
+
+**Order of operations in `router.call` is a security property, not a style choice.** Trust check → blackout check → **`policy.check()`** → `governor.reserve()` → dispatch under a timeout → backoff on 429 → validate the response against its schema → `ledger.record()` (**including cache hits**) → metrics. R1 found the boundary check sitting *below* the cache lookup, so a `CLIENT_CONFIDENTIAL` payload with a warm entry was served with no enforcement at all.
 
 ## `bok-ui` — design system
 
@@ -79,6 +92,8 @@ Response cache is content-addressed (hash of model + lane + normalised prompt + 
 Tokens in OKLCH via Tailwind v4 `@theme`. Neutral ramp is a **warm graphite** — not blue-grey, not pure grey — paper `oklch(0.985 0.004 85)`, ink `oklch(0.22 0.012 85)`, twelve steps. One accent per product from a shared chroma: agent-perimeter amber `oklch(0.72 0.16 68)`, ledger-sense green `oklch(0.58 0.11 158)`, selector-drift indigo `oklch(0.55 0.14 268)`, ground-truth slate-blue `oklch(0.52 0.10 232)`.
 
 **Severity and provenance state are never encoded in colour alone** — each carries a glyph and a text label. Two target markets are literally regulated for accessibility.
+
+**Every semantic and accent colour exists twice, and the halves are not interchangeable.** The base token is fill, field and badge ground, held to 3:1; the `-ink` sibling is text, glyphs, meaning-bearing borders and **the focus ring**, held to 4.5:1. Setting `color:` or `outline:` from a base token is the mistake this split exists to prevent — it is how the focus ring shipped at 2.46:1 through an R1 pass that was looking straight at it. `agent-perimeter` amber is the sharpest case: `00` §8 fixes the value, it measures 2.46:1 on paper and falls outside sRGB, so it is a fill and nothing else (design §8.5). Ratios are measured through the real OKLCH → WCAG transform by `scripts/check-contrast.mjs`, never approximated as `L³`, and the gate runs before axe because axe only sees what a story renders.
 
 Type, all OFL and **self-hosted** (no Google Fonts CDN call — a privacy and offline-demo liability): Newsreader for display/report headings, Geist Sans for UI, IBM Plex Mono for data and code. **Tabular numerals everywhere a number appears** — a column of figures that shifts as it updates is the fastest way to look amateur to a controller.
 
@@ -110,7 +125,9 @@ Python 3.12+, `uv`, `ruff`, `mypy --strict` on all of `bok-core`. TypeScript str
 
 ## Testing bar
 
-Unit (no network, no model) · contract tests with recorded cassettes per provider, plus a nightly live smoke test allowed to fail CI but required to open an issue — that is how you learn a free model was deleted before a client does · degraded mode ≥70% · boundary (`CLIENT_CONFIDENTIAL` raises on every free-tier route; redaction verification catches a deliberately planted identifier) · golden-file diffs for reports and SARIF · Playwright E2E including keyboard-only paths · axe zero serious/critical.
+Unit (no network, no model) · contract tests with recorded cassettes per provider, plus a nightly live smoke test allowed to fail CI but required to open an issue — that is how you learn a free model was deleted before a client does · degraded mode **per repo, in its own declared unit** (no shared threshold) plus the shared `assert_blackout_complete()` · boundary (`CLIENT_CONFIDENTIAL` raises on every free-tier route **including a warm cache**; redaction verification catches a **missed** detection, not a planted one) · golden-file diffs for reports and SARIF · Playwright E2E including keyboard-only paths · **axe in a real browser** — `vitest-axe` under jsdom silently skips `color-contrast`, so a jsdom-only sweep cannot evidence the WCAG claim · zero serious/critical.
+
+**The meta-rule R1 exists to enforce: a test that does not fail when you break the thing is not evidence.** Before marking any control green, break it and watch the test go red. Five of them did not.
 
 ## Definition of done
 
@@ -118,4 +135,15 @@ Brief section 10, seven items — including a copier run that produces a repo pa
 
 ## Before planning
 
-`00` §12 has 7 open decisions and every one of them lands on this repo. None are answered. Do not assume them — ask.
+**`00` §12's seven open decisions are answered.** Design §1.1 records all seven with their reasoning
+— publish (not vendor); four independent CLIs (no `bok-cli`); week 0 ships and tests the **empty**
+provider inventory; compose-only, no third-party data processor; `backoffice-kit` public from commit
+one and the consumers public at first release; Apache-2.0 everywhere plus DCO; 35–40 h/week. **Do not
+re-ask them.** If you want to reopen one, argue against the recorded reasoning in §1.1 rather than
+treating it as unanswered.
+
+What is genuinely still open, and is data entry rather than a decision: **`providers.yaml` is empty
+and due before week 4.** The twelve-field checklist is `docs/providers.md`. One question decides
+`ledger-sense` on its own — does any free-tier, vision-capable provider state *in writing* that it
+does not train on inputs? *No* is a perfectly good answer, and the design already accommodates it
+with no code change.

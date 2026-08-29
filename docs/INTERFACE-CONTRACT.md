@@ -1,8 +1,15 @@
 # BackOffice Kit — Interface Contract
 
-**Version 0.1 · 27 August 2026 · Status: agreed**
+**Version 0.2 · 29 August 2026 · Status: agreed**
 Authoritative surface of `bok-core` and `bok-ui`. Derived from
-`docs/superpowers/specs/2023-11-14-backoffice-kit-design.md`.
+`docs/superpowers/specs/2026-08-27-backoffice-kit-design.md`.
+
+> **v0.2 is a correctness revision of v0.1, not a redesign.** It closes defects found by a
+> line-by-line audit of the two implementation plans against this contract, `00`, and the four
+> consumer designs. Some were places where v0.1 and the plan disagreed and the plan was wrong;
+> some were requirements from `00` that had no symbol here to carry them; two were security holes
+> in the surface itself. **No v0.1 symbol is removed or renamed.** §9 lists every change, and
+> `ground-truth`'s `_bok_shim.py` — which mirrors v0.1 — must be re-synced against it.
 
 ## How to use this document
 
@@ -32,6 +39,12 @@ class Sensitivity(StrEnum):
 class Trust(StrEnum):
     TRUSTED = "TRUSTED"
     UNTRUSTED = "UNTRUSTED"      # attacker-authored content; forces schema + tool denial
+
+_RANK = {"PUBLIC": 0, "SYNTHETIC": 1, "REDACTED": 2, "CLIENT_CONFIDENTIAL": 3}
+# Sensitivity.rank -> int. StrEnum compares lexically, so "CLIENT_CONFIDENTIAL" < "PUBLIC"
+# is True and `payload.sensitivity > lane.max_sensitivity` silently means nothing. Ordering
+# is therefore explicit. Do NOT "fix" this by making Sensitivity an IntEnum: the wire format
+# is the string, the ledger column is TEXT, and all four consumers compare against "PUBLIC".
 
 class SensitivityViolation(Exception): ...
 
@@ -66,10 +79,24 @@ class ProviderCapability(BaseModel):
 
 class CallContext(BaseModel):
     commercial: bool = False
+    redacted_opt_in: bool = False                       # 00 R4 -- see below
+    max_verified_age: timedelta = timedelta(days=90)    # spec 10.2 property 6 -- see below
 
 def check(payload: Labelled[Any], context: CallContext, provider: str) -> None:
     """Raises SensitivityViolation. The message cites the Claim's Source."""
 ```
+
+**`redacted_opt_in` closes a hole in v0.1.** `00` R4's table says `REDACTED` may reach a free tier
+*"only with an explicit per-project opt-in flag."* v0.1 had no such flag anywhere, so `REDACTED`
+routed on provider terms alone and the opt-in existed only as prose in a table. It is now a field,
+it defaults to `False`, and `test_redacted_without_opt_in_is_refused` proves it.
+
+**`max_verified_age` makes staleness enforceable rather than advisory.** Spec §10.2 property 6
+requires that past the threshold *"the health strip warns and `REDACTED` routing blocks."* v0.1
+exposed `verified_at` and nothing in the library ever read it. `check()` now refuses anything above
+`SYNTHETIC` to a provider whose `verified_at` is null or older than `max_verified_age`, and the
+message says how stale it is. `00` §11's *"re-verify on the day you build"* only happens if
+something nags.
 
 Refusal messages **quote their evidence** — the terms URL, retrieval date and the quoted sentence
 carried by the `Claim`. A refusal a client's counsel cannot audit is not a control.
@@ -82,15 +109,42 @@ behaves as `False`. An unverified provider is ineligible above `PUBLIC` / `SYNTH
 ```python
 class RedactionResult(BaseModel):
     text: str
-    verified: bool               # False if any original identifier survived
-    surrogates: dict[str, str]
-    failures: list[str]
+    verified: bool                     # False if ANY detector still fires on the output
+    surrogate_count: dict[str, int]    # kind -> count. NEVER the originals -- see (1)
+    failures: list[str]                # detector kinds that fired, never the matched text
 
-def redact(payload: Labelled[str]) -> RedactionResult: ...
+    def labelled(self) -> Labelled[str]:
+        """The redacted text as a REDACTED payload. Raises if verified is False, so
+        'forgot to check the flag' is unrepresentable rather than merely discouraged."""
+
+def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult: ...
 ```
 
-Detect → stable surrogate (structure survives) → **verification pass that re-scans the output**.
-`verified` is a field on a result the caller must destructure, never a bare bool that can be dropped.
+Detect → keyed stable surrogate (structure survives) → **verification pass that re-runs every
+detector over the output**. Three corrections to v0.1, each closing a real hole:
+
+1. **`surrogates: dict[str, str]` is replaced by `surrogate_count: dict[str, int]`.** The v0.1 map
+   was keyed by the *original identifier*, so the object returned from redaction carried every
+   piece of PII it had just removed — and `guard_write` takes that object as an argument. Anything
+   that logged, cached or serialised a `RedactionResult` re-leaked the document. Where a caller
+   genuinely needs the reverse map it lives on the `CLIENT` plane behind `egress`, never in the
+   value handed back.
+2. **Surrogates are HMAC-keyed, not a bare hash.** `sha256(identifier)[:8]` is reversible by
+   dictionary attack for exactly the identifier classes that matter: the entire 9-digit
+   routing-number space brute-forces in seconds, and so does any phone number. `key` is required,
+   comes from the environment, and is never committed. Same input plus same key still yields the
+   same surrogate, so joins and document structure survive exactly as before.
+3. **Verification re-runs detection; it does not re-search for what it already found.** v0.1's
+   check was *"is any string I replaced still present in the output"* — a tautology, because
+   replacement is what removed them. Absent a deliberately injected leak it could not fail, which
+   made the single most important control in the system decorative. Verification now re-runs every
+   detector over the output and fails if any fires. That is what catches the real failure mode: an
+   identifier the first pass split, overlapped, or never had a pattern for.
+
+**Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
+ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
+`docs/methodology.md` states which of those six are covered and which are not — an undetected class
+is a boundary hole, and naming it is the difference between a limitation and a lie.
 
 ### 1.4 `fingerprint`
 
@@ -117,9 +171,28 @@ class Plane(StrEnum):
     CLIENT = "CLIENT"        # compose-only, no third-party processor
     DEMO = "DEMO"            # SYNTHETIC / PUBLIC only, hostable anywhere
 
-def guard_write(path: Path, payload: Labelled[bytes], plane: Plane) -> None:
-    """Raises SensitivityViolation. Refuses CLIENT_CONFIDENTIAL to a non-CLIENT plane,
-    and refuses any payload whose redaction verification did not pass."""
+def guard_write(path: Path, payload: Labelled[bytes], plane: Plane,
+                *, redaction: RedactionResult | None = None) -> None:
+    """Authorise a write. Raises SensitivityViolation; never writes anything itself.
+
+    Refuses, in order:
+      * CLIENT_CONFIDENTIAL to any plane that is not CLIENT;
+      * REDACTED to DEMO -- DEMO is SYNTHETIC/PUBLIC only, which v0.1 stated in a
+        code comment and enforced nowhere;
+      * REDACTED with no RedactionResult supplied -- an unproven redaction is an
+        unredacted one, and in v0.1 the proof was an optional argument;
+      * any payload whose redaction verification did not pass.
+    """
+
+def write_guarded(path: Path, payload: Labelled[bytes], plane: Plane,
+                  *, redaction: RedactionResult | None = None) -> None:
+    """guard_write() and then the write itself, atomically (tmp file + os.replace).
+
+    PREFER THIS. The bare guard is advisory: it authorises and returns, and nothing
+    obliges the caller to have called it. Use guard_write() alone only for streamed
+    writes the library cannot perform, and pair it with the template's
+    `test_no_unguarded_writes`, which AST-scans for open(...,'w') / Path.write_* /
+    shutil.copy outside the guard."""
 ```
 
 **Required by `selector-drift`** (evidence write path: capture → redact → verify → store, quarantine
@@ -163,9 +236,19 @@ class Claim(BaseModel, Generic[T]):
     confidence: float | None = None
     calibration: Calibration | None = None
     observed_at: datetime
-    parents: list["Claim"] = []
+    parents: list[Claim] = []        # BARE, deliberately -- see the note below
     caveat: str | None = None
 ```
+
+**`parents` is annotated `list[Claim]`, not `list[Claim[object]]`.** This is not style. A
+self-referencing *parametrised* field on a generic Pydantic model fails at parametrisation time:
+`Claim[Decimal]` raises `AttributeError: __pydantic_fields__` on pydantic 2.13 for both
+`list[Claim[object]]` and `list[Claim[Any]]`, with or without an explicit `model_rebuild()`
+(verified 29 Aug 2026, pydantic 2.13.5, CPython 3.12). The bare form works — and it is also the
+better semantics, because it preserves parent instance identity through validation and keeps a
+parent's `Decimal` a `Decimal` instead of revalidating it into a fresh object. `mypy --strict`
+reports `[type-arg]` on the bare form, so the field carries a one-line
+`# type: ignore[type-arg]` naming this reason.
 
 ### 2.2 `Source` — discriminated union, seven variants
 
@@ -192,7 +275,24 @@ source code" would be indistinguishable from "no bbox because extraction failed.
 | I3 | **`DETERMINISTIC` implies `confidence is None`** | `selector-drift` §3.5 |
 | I4 | `caveat` propagates to children verbatim | `ground-truth` §9 |
 | I5 | **`Claim[Decimal]` serialises `value` as a string, never a float** | `ledger-sense` §4.1.2 |
-| I6 | I1 and I4 hold at chain depth ≥ 5 | `ground-truth`, `ledger-sense` |
+| I6 | I1 and I4 hold at chain depth ≥ 5, over **branching** chains, not only linear ones | `ground-truth`, `ledger-sense` |
+| I7 | **`DERIVED` inherits unverified-ness.** `renders_as_fact()` is False if *any* ancestor is a `MODEL` claim that is not calibrated | all four |
+
+**I1 and I7 are enforced by a validator on `Claim`, not only by the `derive()` helper.** v0.1 said
+these were *"enforced by bok-core"* while the only enforcement lived in a helper that a consumer
+bypasses simply by constructing a `Claim` directly.
+
+**I7 is new in v0.2 and it is the most consequential correction in this document.** v0.1's
+`renders_as_fact()` returned `True` for every method that was not `MODEL`, so one `derive()` hop
+laundered an uncalibrated model reading into a fact. Under v0.1 the worked example that `00` §10.4
+makes a definition-of-done item — a money figure derived from an uncalibrated 0.72 model read —
+renders as a verified fact. That is the exact failure this programme exists to reject, shipped in
+the flagship demo.
+
+**I6 says "branching" for a reason.** A linear chain re-derived five times from a single parent
+exercises `min()` over one element every hop and proves almost nothing. Real chains are DAGs:
+`ground-truth` runs item verdict → field accuracy → curve → threshold → recommendation with fan-in
+at each level. The `hypothesis` strategy generates branching chains with shared parents.
 
 ### 2.4 `render`
 
@@ -252,11 +352,40 @@ def call(
     tools_disabled: bool = False,
     cache: CacheMode = CacheMode.ENABLED,
     failover: FailoverMode = FailoverMode.ENABLED,
+    params: Mapping[str, str | int | float | bool] = {},   # temperature, top_p, n ...
+    timeout_s: float = 30.0,
+    max_attempts: int = 3,
 ) -> Response:
-    """Raises SensitivityViolation before dispatch.
+    """Raises SensitivityViolation before dispatch AND before any cache lookup.
     If payload.trust is UNTRUSTED, refuses to dispatch unless response_schema is
-    provided AND tools_disabled is True. Enforced, not defaulted."""
+    provided AND tools_disabled is True -- and validates the response against that
+    schema on the way back. Enforced, not defaulted."""
 ```
+
+**`params` exists because the judge lane needs it.** `00` §2.3 specifies the judge lane as
+*"n≥3 sampling and majority vote"*. v0.1 had no way to express `n`, or a temperature, or anything
+else — the transport signature carried no parameters at all.
+
+**Mandatory order of operations inside `call()`.** v0.1 left this unstated and the implementation
+plan got three of the steps wrong, each a live defect:
+
+| # | Step | Why the order is load-bearing |
+|---|---|---|
+| 1 | trust enforcement | before anything can touch the network |
+| 2 | blackout check | before the cache, or a warm cache masks a blackout |
+| 3 | **`policy.check()`** | **before the cache lookup.** The plan consulted the cache first, so a `CLIENT_CONFIDENTIAL` payload with a warm entry returned text having never been boundary-checked. Definition-of-done item 6 passed only because the test's cache was cold |
+| 4 | `governor.reserve()` | **before dispatch.** The plan called `consume()` *after* a successful call, so the daily ceiling recorded overruns instead of preventing them — and a `QuotaExceeded` raised post-call discarded a response whose quota had already been spent. "Fails closed" means reserving first and reconciling actual tokens after |
+| 5 | dispatch under `timeout_s` | v0.1 specified no timeout anywhere. One hung free-tier endpoint stalls an entire sweep |
+| 6 | on 429: `backoff_delay()`, honouring `Retry-After` | `backoff_delay()` existed in the plan and **no caller ever invoked it**. R5's backoff was dead code behind a green tick |
+| 7 | validate the response against `response_schema` | the plan passed the schema to the transport and never checked the reply. For `UNTRUSTED` content, constraining the *output* is the whole control; without this, `agent-perimeter` B6's mitigation is still just a prompt |
+| 8 | `ledger.record()` — **including cache hits** | see `Response.call_id` under §3.4 |
+| 9 | `obs.record_call_metrics()` | the plan defined the metric and never called it, so "quota is the cost column" reported zero forever |
+
+**Failover walks `lanes.eligible(...)`, never `registry.keys()`, and re-resolves `model_id` per
+provider.** The plan failed over to every provider in the inventory regardless of the lane's
+capability predicate, and reused the first provider's `model_id` on the second — writing a model id
+against a provider that never served it. That is false provenance in the table `ground-truth`
+treats as ground truth.
 
 | Parameter | Required by | Why |
 |---|---|---|
@@ -275,10 +404,40 @@ class Quota(BaseModel):
 def remaining(provider: str) -> Quota:
     """PUBLIC QUERY, not only internal enforcement. ground-truth's scheduler asks
     before dispatching each sweep batch."""
+
+@contextmanager
+def reserve(provider: str, *, est_tokens: int, priority: Priority) -> Iterator[Reservation]:
+    """Atomically claim quota BEFORE dispatch; reconcile the estimate on exit.
+
+    One BEGIN IMMEDIATE transaction spans the check and the increment, so two
+    concurrent callers cannot both pass a ceiling that admits one. Raises
+    QuotaExceeded without dispatching. Reservation.settle(actual_tokens) corrects the
+    estimate; an abandoned reservation is released, not leaked."""
+
+class Priority(StrEnum):
+    INTERACTIVE = "INTERACTIVE"   # a human is waiting
+    BATCH = "BATCH"               # a sweep; yields to INTERACTIVE
+
+def backoff_delay(attempt: int, *, retry_after_s: float | None = None,
+                  cap_s: float = 60.0) -> float:
+    """Full jitter: uniform(0, min(2**attempt, cap_s)). A Retry-After from the
+    provider wins -- guessing over a number the server handed you is not backoff."""
 ```
 
-Persistent token buckets per provider, exponential backoff with full jitter on 429, priority-lane
+Persistent buckets per provider, exponential backoff with full jitter on 429, priority-lane
 queue, hard daily ceiling that fails closed. Quota consumed is exported as a Prometheus metric.
+
+**Windows are rolling, not calendar.** A fixed `%Y%m%d%H%M` bucket lets a caller spend a full
+minute's RPM at `10:00:59` and another full minute's at `10:01:00` — twice the ceiling inside one
+second, which is precisely the 429 the governor exists to prevent. Buckets roll over 60s / 24h on a
+timestamped event table, pruned on write so it does not grow one row per provider per minute
+forever.
+
+**`cap_s` bounds the backoff.** Uncapped `2**attempt` reaches twelve days at attempt 20.
+
+**The priority queue is a v0.2 symbol because `00` R5 requires one and there was none.** v0.1 named
+a "priority-lane request queue" in prose; the plan contained no queue at all. Two lanes are enough:
+`ground-truth`'s 9,000-call `BATCH` sweep must not starve an `INTERACTIVE` demo.
 
 ### 3.4 `ledger` — a queryable table, not structured logs
 
@@ -294,14 +453,34 @@ CREATE TABLE bok_ledger (
   latency_ms            INTEGER NOT NULL,
   tokens                INTEGER,
   quota_consumed        INTEGER,
+  from_cache            BOOLEAN NOT NULL DEFAULT 0,    -- v0.2, see below
+  served_call_id        TEXT,                          -- the row a cache hit replayed
   observed_at           TIMESTAMPTZ NOT NULL
 );
+CREATE INDEX idx_ledger_model_time ON bok_ledger(model_id, observed_at);
+CREATE INDEX idx_ledger_lane_time  ON bok_ledger(lane, observed_at);
 ```
 
 ```python
-def record(...) -> str: ...                       # returns call_id
-def query(**filters) -> list[LedgerRow]: ...
+def record(...) -> str: ...                                     # returns call_id
+def query(*, since: datetime | None = None, until: datetime | None = None,
+          limit: int = 1000, **filters) -> list[LedgerRow]: ...
 ```
+
+**A cache hit is a ledger row.** v0.1's plan returned `call_id=None` for a cached response, which
+breaks `ModelSource(ledger_call_id=...)`: a `Claim` built from a cached call had no source to point
+at. In a cache-heavy $0 build that silently exempts the majority of calls from `00` R7's *"every
+model call is recorded"*. A hit now writes its own row with `from_cache=1`, `quota_consumed=0` and
+`served_call_id` pointing at the original — so provenance resolves, and `ground-truth` can tell a
+replay from a fresh sample rather than measuring zero variance and believing it.
+
+**`since` / `until` / `limit` exist** because the regression module works in time ranges, and
+because an unbounded `SELECT *` over a sweep-sized ledger is a memory event rather than a query.
+
+**Concurrency is configured, not assumed.** `PRAGMA journal_mode=WAL`, `busy_timeout=5000`,
+`check_same_thread=False` behind a connection lock, and one commit per batch rather than one fsync
+per call. A default `sqlite3.connect` raises `ProgrammingError` from any second thread and
+`database is locked` under any parallelism — and the sweep this table exists to serve is parallel.
 
 **Hard dependency for `ground-truth`**: `outputs.ledger_call_id` is a foreign key into this table.
 Without it, B6 fingerprint tracking and B8 provider attribution are impossible and the regression
@@ -312,11 +491,32 @@ none, and `ground-truth` must report that rather than imply a version it cannot 
 
 ```python
 def probe_all(ttl: timedelta) -> HealthStrip: ...        # startup capability probe
-def invalidate(pattern: str | None = None) -> int: ...   # cache invalidation
+def invalidate(pattern: str | None = None) -> int: ...   # SQL LIKE pattern; None clears all
 ```
 
-Cache key is content-addressed: `hash(model + lane + normalised prompt + params)`. SQLite-backed,
-explicit TTL.
+Cache key is content-addressed:
+`hash(provider + model_id + lane + normalised prompt + canonical params + schema fingerprint)`.
+SQLite-backed, explicit TTL, bounded size with LRU eviction, WAL as above.
+
+**Every term in that key is load-bearing and v0.1's plan omitted three.** `provider`, because
+`ground-truth` B8 says one model behind two providers may be measuring the serving stack, and a key
+that erases the provider erases the finding. `params`, because the plan's key carried
+`{"schema": bool(...)}` and nothing else — so a temperature change was a cache hit. `schema
+fingerprint`, because a boolean cannot distinguish two different response schemas, and the plan
+would return a response validated against schema A to a call requesting schema B.
+
+**`probe_all` demotes; it does not merely display.** `00` R2 requires a dead primary be *"demoted
+to the next fallback in the chain"*. In v0.1's plan the `HealthStrip` was consumed by the UI and by
+nothing else: `lanes.resolve()` read the static `reachable` field out of `providers.yaml`, so
+routing never learned that a provider had died. `resolve()` now takes the strip and an unhealthy
+provider is ineligible.
+
+**The probe's TTL cache is SQLite-backed, not per-process.** A process-local cache re-probes every
+provider on every CLI invocation — spending real free-tier quota to ask whether there is any quota.
+
+**The probe is concurrent and time-boxed.** Nine providers pinged serially with no timeout is a
+startup path that can hang forever; the whole point of R2 is that startup, not the run, absorbs
+this cost.
 
 ---
 
@@ -340,10 +540,23 @@ class Finding(BaseModel):
     partial_fingerprints: dict[str, str] = {}
     properties: dict[str, Any] = {}
 
-def to_sarif(findings: list[Finding]) -> dict:
+def to_sarif(findings: list[Finding], *, tool_name: str, tool_version: str) -> dict:
     """SARIF 2.1.0. logicalLocations, partialFingerprints and properties are
-    first-class, not only physicalLocation."""
+    first-class, not only physicalLocation.
+
+    Every result carries properties.bok_provenance = to_rail(finding.claim) and
+    properties.bok_severity = the ladder value."""
 ```
+
+**The provenance travels with the finding.** v0.1's emitter dropped `Finding.claim` entirely — so
+the one artifact these products hand to an auditor was the single place the evidence chain did not
+reach. For a programme whose thesis is *"every number traceable to its origin"*, an export that
+strips the origin is the whole proposition failing at the export boundary. `properties` is SARIF's
+sanctioned home for it and costs nothing.
+
+**The ladder value rides on the result, not only on the rule.** SARIF's `level` vocabulary collapses
+CRITICAL and HIGH into `error` and MEDIUM and LOW into `warning`; without `properties.bok_severity`
+a consumer reading results cannot recover which of the five it was.
 
 **Two consumer classes, and the vocabulary must serve both.** `agent-perimeter` emits security
 findings about a live server (no natural `physicalLocation` — B7). `selector-drift` emits
@@ -361,11 +574,24 @@ is a first-class metric.
 ```python
 @contextmanager
 def blackout() -> Iterator[None]:
-    """Every lane raises ProvidersUnavailable. Defeats the response cache, the probe
-    TTL cache, the fallback chain, and any local-fallback that is not deterministic."""
+    """Every lane raises ProvidersUnavailable, and no socket may open.
+
+    Defeats, each separately tested: the response cache; the probe TTL cache in BOTH
+    layers, process and SQLite; the fallback chain; and any local-fallback that is
+    not in fact deterministic.
+
+    Blackout also patches socket.socket.connect to raise. That is what makes the
+    assertion below mean anything: a path that bypasses the router entirely -- a
+    vendored SDK, an httpx call in a helper, a library's own telemetry -- is caught
+    by the socket, never by our own bookkeeping."""
 
 def assert_blackout_complete() -> None:
-    """Asserts no code path reached a provider under blackout. THE shared test."""
+    """Asserts no code path reached a provider under blackout. THE shared test.
+
+    Counts real egress attempts observed at the socket. v0.1's counter was incremented
+    by note_provider_reached(), which nothing in the library ever called -- so the one
+    test the design names 'the valuable shared test' passed unconditionally, in all
+    four repos, forever."""
 
 def census(inventory: list[Capability]) -> CensusReport:
     """Computes the model-dependent ratio in the caller's own declared unit and
@@ -392,12 +618,32 @@ Every repo publishes its floor and its unit in `docs/methodology.md`.
 ### 6.1 Tokens and contracts — land whole
 
 OKLCH warm-graphite ramp (paper `oklch(0.985 0.004 85)`, ink `oklch(0.22 0.012 85)`, twelve steps);
-four product accents; `critical/high/medium/low/info` and `verified/modelled/unverified` semantic
-scales; Newsreader / Geist Sans / IBM Plex Mono self-hosted with tabular numerals; 4px base; radius
+four product accents **each with an `-ink` sibling**; `critical/high/medium/low/info` and
+`verified/modelled/unverified` semantic scales **in the same two-role split**; Newsreader / Geist Sans / IBM Plex Mono self-hosted with tabular numerals; 4px base; radius
 6/2/0; **density mechanism** shipping `comfortable` and `compact`; visible focus rings; **glyph +
 text label on every semantic colour**; `prefers-reduced-motion`; **print stylesheet as standalone
 CSS** (its first consumer is `agent-perimeter`'s server-rendered `report/html.py`, which never
 imports React).
+
+**The two-role split is part of the surface, not an implementation detail.** Every semantic and
+accent colour exists twice. The base token is the fill, the field and the badge ground and is held
+to the 3:1 floor for a meaningful graphic; the `-ink` sibling is text, glyphs, borders that carry
+meaning, and the focus ring, and is held to 4.5:1. A consumer that sets `color:` from a base token
+is using the wrong half, and its own axe run will say so.
+
+```css
+--bok-accent-agent-perimeter-ink   --bok-accent-ledger-sense-ink
+--bok-accent-selector-drift-ink    --bok-accent-ground-truth-ink   --bok-accent-ink
+```
+
+One recorded exception, in design §8.5: `agent-perimeter` amber `oklch(0.72 0.16 68)` is fixed by
+`00` §8 and measures 2.46:1 on paper — below even the graphic floor, and outside sRGB at that
+chroma. It is a fill only. `--bok-accent-ink` is what an `agent-perimeter` screen reaches for
+anywhere a reader has to read it, the focus ring included.
+
+Every ratio in `tokens.css` is measured by `scripts/check-contrast.mjs` (plan Task 11, step 0),
+which runs before the axe job because axe only sees what a story renders — a token no story
+exercises can drift below AA and reach a consumer repo green.
 
 ### 6.2 Nine components
 
@@ -407,8 +653,13 @@ only) · `ConfidenceMeter` · `EmptyState` · `ErrorState` · `Skeleton`
 Non-obvious props:
 
 ```tsx
-<EmptyState scope={{ measured: 24, skipped: 3, reason: "no scope file" }} />
+<EmptyState scope={{ noun: "findings", measuredNoun: "checks",
+                     measured: 24, skipped: 3, skippedReason: "no scope file" }} />
 // Renders a DENOMINATOR, never a celebration. Required by AP, SD and GT alike.
+// measuredNoun is REQUIRED: v0.1 hardcoded the word "checks", which renders as
+// "No quarantined runs for the 41 checks that ran" in selector-drift. A shared
+// component must not carry one consumer's vocabulary -- the same rule this contract
+// already applies to the SARIF emitter.
 
 <ConfidenceMeter calibration={Calibration} />   // the object, never a float
 
@@ -419,6 +670,32 @@ Non-obvious props:
 `FindingsTable` is virtualised, column-resizable, keyboard-navigable, CSV/JSON export. A separate
 **roving-tabindex list-navigation primitive** ships alongside it — `ledger-sense`'s review queue is a
 queue (`J`/`K`/`Enter`/`E`/`R`, fifty exceptions mouse-free), not a table.
+
+Four behaviours the v0.1 surface implied and did not require, each now explicit:
+
+- **Keyboard navigation addresses the whole dataset, not the rendered window.** A virtualised table
+  whose roving index is bounded by the visible slice stops dead at the bottom of the first
+  viewport. The active index indexes `rows`; the table scrolls the window to follow it.
+- **CSV export neutralises formula injection.** A cell beginning `=`, `+`, `-`, `@`, tab or CR is
+  prefixed with `'`. These exports are opened in Excel by controllers, and a findings table that
+  ships a live formula out of an attacker-authored tool description is a vulnerability in a
+  security product. Output is CRLF with a UTF-8 BOM so Excel reads it correctly.
+- **The keyboard primitive takes a key map, not a fixed one.** `ledger-sense` needs `E` and `R`
+  alongside `J`/`K`/`Enter`; a hook exposing only `onActivate` cannot serve it.
+- **One rail, not one per `Claim`.** The rail is a 380px right-hand panel — singular, in `00` §5.3.
+  A `<Claim>` that renders its own `<ProvenanceRail>` gives a table of 500 figures 500 fixed panels,
+  and two overlapping ones the moment a user opens a second. `<ProvenanceRailProvider>` owns one;
+  `<Claim>` requests it. Opening moves focus into the rail, closing returns it to the figure, and
+  the trigger carries `aria-expanded` / `aria-controls`.
+
+**Responsive to 375px is a v0.1 requirement the 380px rail cannot meet.** Below 420px the rail goes
+full-width with a visible close affordance. `00` §5.5 requires 375px; a fixed 380px panel is wider
+than the viewport.
+
+**`PartialFailureState` joins the list.** `00` §5.5 names four states — empty, loading, error and
+**partial failure** — and v0.1 shipped three. Partial failure is the state a degraded-mode product
+spends most of its life in; it is the one that must not be missing. It takes what succeeded, what
+did not, and why, and renders all three.
 
 ### 6.3 Deferred — build locally, propose promotion on second use
 
@@ -498,10 +775,15 @@ pattern `ground-truth` already specifies. On the web side, plain React plus a lo
 **A shim is never acceptable for `boundary`**: `ledger-sense` explicitly re-tests the boundary against
 the published package because a mocked boundary stops nothing at 2am in week 11.
 
+**`ground-truth`'s `_bok_shim.py` mirrors v0.1 and is now stale.** Re-sync it before phase 1 or it
+encodes the `renders_as_fact` bug (I7) and the v0.1 cache-before-boundary ordering into the one
+repo whose entire product is measuring whether claims are true.
+
 ---
 
 ## 9. Changelog
 
 | Version | Date | Change |
 |---|---|---|
-| 0.1 | 2023-11-14 | Initial contract. Adds beyond `00` §4/§5: `Claim.derivation`, `Claim.calibration`, `DocumentSource`, `RuleSource`, `DomSource`, `Claim[Decimal]` string serialisation, `Labelled` over bytes/handles, `boundary.fingerprint`, `boundary.egress`, the `Trust` axis, `CallContext.commercial`, `router(cache=DISABLED)`, `router(failover=DISABLED)`, `governor.remaining()`, ledger as a queryable table, `testing.degraded`. Removes: the shared `≥70%` degraded-mode assertion. |
+| 0.2 | 2026-08-29 | **Correctness revision.** Adds: `Sensitivity.rank`; `CallContext.redacted_opt_in` and `.max_verified_age`; `RedactionResult.labelled()`; `redact(key=)`; `egress.write_guarded()` and `guard_write(redaction=)`; invariant I7 (`DERIVED` inherits unverified-ness) and validator-enforced I1; `router.call(params=, timeout_s=, max_attempts=)` plus a mandatory order of operations; `governor.reserve()`, `Priority`, `backoff_delay(retry_after_s=, cap_s=)`; `ledger.from_cache` / `served_call_id` / `query(since=, until=, limit=)`; provider + params + schema fingerprint in the cache key; probe demotion and an SQLite-backed probe TTL; SARIF `properties.bok_provenance` / `bok_severity`; socket-level `blackout()`; `EmptyState.measuredNoun`; `PartialFailureState`; a single-rail provider; CSV injection neutralisation. Changes: `RedactionResult.surrogates` → `surrogate_count` (v0.1's map carried the plaintext PII it had just removed); `Claim.parents` annotated bare (`list[Claim[object]]` does not import under pydantic 2.13). Removes: nothing. |
+| 0.1 | 2026-08-27 | Initial contract. Adds beyond `00` §4/§5: `Claim.derivation`, `Claim.calibration`, `DocumentSource`, `RuleSource`, `DomSource`, `Claim[Decimal]` string serialisation, `Labelled` over bytes/handles, `boundary.fingerprint`, `boundary.egress`, the `Trust` axis, `CallContext.commercial`, `router(cache=DISABLED)`, `router(failover=DISABLED)`, `governor.remaining()`, ledger as a queryable table, `testing.degraded`. Removes: the shared `≥70%` degraded-mode assertion. |

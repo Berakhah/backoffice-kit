@@ -3,3 +3,10 @@ __pycache__/
 node_modules/
 .env
 .DS_Store
+
+# R1: a byte-identical copy of ../Starting_Documents/ appeared inside this repo. The
+# briefs are the programme's strategy documents and this repo is PUBLIC FROM COMMIT ONE
+# (design 1.4), so one `git add -A` publishes them permanently. Ignored rather than
+# deleted -- the copy is not ours to remove. CLAUDE.md references them at ../, outside
+# the repo, which is where they belong.
+Starting_Documents/

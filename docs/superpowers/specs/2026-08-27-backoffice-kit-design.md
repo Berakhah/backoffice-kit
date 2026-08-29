@@ -30,6 +30,7 @@ This repo **is** `00`. Sections 4, 5, 6 and 10 of that document are its spec. Th
 |---|---|---|
 | A | The 70% degraded-mode floor | **Not testable as stated. `bok-core` ships the harness; each repo asserts its own floor.** §7. `00` §2.2 and §7 use two different denominators for the same test. Deleted as a shared constant. |
 | B | `bok-ui` week-0 scope | **Tokens land whole; components land lazily.** Nine of thirteen ship in v0.1; charts, `QuotaStrip`, `RunTimeline`, `DiffView`, two `EvidencePane` adapters and the `dense` mode defer to the phase that first demands them. §8. |
+| C | `00` §8's accent values fail WCAG as text | **The four values stand; their role narrows.** Measured on paper, `agent-perimeter` is 2.46:1 and `ledger-sense` 3.89:1 — both below the 4.5:1 AA text floor, and the amber below even the 3:1 floor for a meaning-bearing graphic. They are brand identity, so they are not moved; each gains an `-ink` sibling (§8.5) and the base token becomes fill-and-field only. |
 
 ### 1.3 Why four independent CLIs — the recorded reason replaced
 
@@ -505,6 +506,37 @@ WCAG 2.2 AA via `axe-core` in CI, zero serious or critical. Full keyboard operat
 Responsive to 375px. Storybook on GitHub Pages showing every v0.1 component in light, dark and both
 shipped densities, with axe passing.
 
+### 8.5 Colour is measured, not estimated — and one accent cannot be text
+
+R1 corrected the severity and dark-mode tokens using `L³` as a stand-in for relative luminance.
+That was good enough to *find* the three light-mode failures but not to *certify* the fixes, and it
+is blind to gamut. Every token is now measured through the real transform — OKLCH → Oklab → linear
+sRGB → WCAG relative luminance, applying the sRGB clip a browser applies, with the pipeline anchored
+against black-on-white = 21.00:1. Four things the approximation had left behind:
+
+1. **`--bok-medium` still failed.** At L 0.72 it measures 2.41:1 — under the 3:1 *border* floor the
+   two-role split was introduced to satisfy, so the R1 fix had not actually fixed it. Now L 0.64,
+   3.27:1.
+2. **The focus ring failed its own criterion.** `outline: 2px solid var(--bok-accent)` is
+   agent-perimeter amber at 2.46:1; SC 1.4.11 and 2.4.11 both floor a focus indicator at 3:1. A
+   visible ring in the default theme is exactly the kind of failure a design review passes over.
+   It is `--bok-accent-ink` (5.42:1) now.
+3. **Four tokens rendered a colour they do not name.** `--bok-high-ink`, `--bok-medium-ink` and two
+   dark-mode inks sat outside sRGB, so the browser clipped them — the contrast held, the hue did
+   not. Chroma is at each one's in-gamut maximum.
+4. **`--bok-neutral-8` is not a text step.** At 4.37:1 it misses AA by 0.13, and it is precisely the
+   step a designer reaches for when they want "muted". Muted text is `--bok-neutral-9` (6.54:1);
+   both are commented in place so the next person does not have to re-measure to find out.
+
+**Residual, recorded rather than fixed:** `agent-perimeter` amber `oklch(0.72 0.16 68)` is outside
+sRGB at that chroma and renders as `#e58e00`. `00` §8 fixes the value and the token test asserts it
+verbatim, so it stays; the note exists so nobody later reads the rendered hex as a token drift.
+
+This is the same failure mode as the five R1 controls, one layer down: the check was real, the
+*instrument* was approximate, and an approximate instrument certifies whatever it cannot resolve.
+Task 11's axe-in-a-real-browser run is the standing guard; the ratios written beside each token are
+the expectation it verifies.
+
 ---
 
 ## 9. The template
@@ -657,3 +689,86 @@ Amendments this design makes to already-approved consumer specs:
    (§3.3).
 
 The full interface surface is `docs/INTERFACE-CONTRACT.md`.
+
+---
+
+## 14. Revision R1 — plan audit, 29 August 2026
+
+Both implementation plans were audited line by line against `00`, this design, and the four consumer
+designs. The corrections are applied in the plans in place, each tagged `R1:`, and the interface
+contract is bumped to **v0.2**. This section records what the audit changed at the *design* level,
+because three of the findings are design-level rather than implementation slips.
+
+### 14.1 Five controls that would have shipped green over nothing
+
+The common shape: a test whose assertion could not fail. This is the precise defect the programme
+exists to sell against, so finding five of them in our own plans is worth stating plainly.
+
+| # | Control | Why the test could not fail |
+|---|---|---|
+| 1 | Redaction verification | It searched the output for the strings it had just replaced. Absent a deliberately injected leak — supplied by a `_force_leak=` argument that lived in *production* code — the answer was always "clean" |
+| 2 | `assert_blackout_complete()` | Its counter was incremented by `note_provider_reached()`, which nothing in the library ever called. It compared 0 with 0, in all four repos |
+| 3 | `CLIENT_CONFIDENTIAL` cannot reach a free tier (DoD 6) | The cache was consulted *before* `policy.check()`. The test passed because its cache was cold |
+| 4 | The `pg_dump` restore test | It echoed a SQL string and grepped its own output. No Postgres, no dump, no restore |
+| 5 | Quota fails closed | `consume()` ran *after* the provider call, and its check-then-act spanned no transaction |
+
+**Amends §11.2.** Add to the test classes: *every control listed in `docs/methodology.md` is broken
+once, deliberately, and its test observed to go red.* A control whose test has never failed is an
+assumption with a green tick.
+
+### 14.2 One invariant the design was missing
+
+**`Claim` invariant I7: `DERIVED` inherits unverified-ness.** §4.3 lists six invariants and none of
+them stops a derivation from laundering an uncalibrated model reading into a fact — `renders_as_fact()`
+returned True for every method that was not `MODEL`. The worked example this design makes a
+definition-of-done item (§11.1 row 4) is precisely that shape: a money figure two hops above an
+uncalibrated 0.72 read. It would have rendered in the verified colour, in the demo whose whole
+purpose is that unsourced numbers look like what they are.
+
+**Amends §4.3.** I7 joins the list, enforced by a validator on `Claim` rather than by `derive()`.
+I1 moves to the same validator for the same reason: §4.3 says these are enforced by `bok-core`, and
+a helper a consumer bypasses by constructing a Pydantic model directly is not enforcement.
+
+### 14.3 Two requirements from `00` with no symbol to carry them
+
+- **`00` R4's per-project opt-in for `REDACTED`.** §3.2 reproduces the sensitivity table but neither
+  this design nor v0.1 of the contract had a flag anywhere. The opt-in existed only as a sentence.
+  Now `CallContext.redacted_opt_in`, defaulting to `False`.
+- **§10.2 property 6, "staleness nags".** `verified_at` was specified, stored, and read by nothing.
+  Now `CallContext.max_verified_age`, and `check()` refuses above `SYNTHETIC` past the threshold.
+
+`00` R5's **priority-lane request queue** was named in §5 G6's neighbourhood and appeared in no task;
+it is now `governor.Priority` with two lanes. `00` R2's **demotion** — the probe's whole purpose —
+was built as a health strip that routing never consulted; `lanes.resolve()` now takes it.
+
+### 14.4 The accessibility gate could not see colour
+
+`vitest-axe` runs under jsdom, which has no layout and computes no colours, so axe's
+`color-contrast` rule is skipped rather than passed. §8.4 and `00` §5.5 make WCAG 2.2 AA
+non-negotiable and name two regulated markets; the plan's evidence for it was 36 assertions that
+never resolved a colour. Under that gate, three of the five severity tokens failing AA as text — and
+a dark mode that re-anchored nothing but paper and ink — were invisible.
+
+**Amends §8.4.** The axe gate is `@storybook/test-runner` + `axe-playwright` against built stories in
+headless Chromium. The jsdom sweep stays for structure and ARIA, where it is genuinely useful.
+
+### 14.5 The template disabled the reason it was chosen
+
+§9 opens: *"Copier, not a GitHub template repo — `copier update` re-applies template changes to
+already-scaffolded repos and a template repo cannot."* Copier writes `.copier-answers.yml` only if
+the template ships `{{_copier_conf.answers_file}}.jinja`, and the plan's template did not. `copier
+update` would have been impossible, which is to say the tool was selected for a capability that was
+then switched off. Seven other required artifacts were absent from the template as well, including
+`.env.example` — without which `docker compose up`, hard constraint 5, fails on the first command.
+
+### 14.6 Carry-back to the other four sessions, in addition to §13
+
+6. **All four** — `INTERFACE-CONTRACT.md` is **v0.2**. Nothing is removed and nothing is renamed, but
+   `RedactionResult.surrogates` becomes `surrogate_count`, `Claim.parents` is annotated bare, and
+   `router.call` gains `params` / `timeout_s` / `max_attempts` plus a mandatory order of operations.
+7. **`ground-truth`** — `_bok_shim.py` mirrors contract v0.1 and must be re-synced before phase 1.
+   Left alone it encodes the I7 laundering bug and the cache-before-boundary ordering into the one
+   repo whose product is measuring whether claims are true.
+8. **All four** — a cache hit is now a ledger row with `from_cache=1` and a `served_call_id`. Any
+   consumer that treats `Response.call_id` as nullable can stop; any consumer counting rows as
+   distinct model calls must filter on `from_cache`.
