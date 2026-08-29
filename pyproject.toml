@@ -1,0 +1,47 @@
+[project]
+name = "bok-core"
+version = "0.0.1"
+description = "Model gateway, data-boundary enforcement, and provenance primitives for the BackOffice Kit."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["pydantic>=2.7", "pyyaml>=6.0", "structlog>=24.1", "prometheus-client>=0.20"]
+
+[project.urls]
+Homepage = "https://github.com/USER/backoffice-kit"
+
+[dependency-groups]
+dev = [
+  "pytest>=8", "pytest-cov>=5", "hypothesis>=6.100", "mypy>=1.10", "ruff>=0.5",
+  "jsonschema>=4.22",
+  "types-PyYAML>=6.0",   # R1: without this `mypy --strict` fails at Task 7 with
+                         # 'Library stubs not installed for "yaml"'. Reproduced.
+  "pip-audit>=2.7",      # R1: 00 section 8 requires dependency scanning. Was absent.
+  "cyclonedx-bom>=4.4",  # R1: 00 section 8 requires an SBOM per release. Was absent.
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# R1: `S` (flake8-bandit) added. This is security tooling and the lint set carried no
+# security rules at all -- which is why the plan's own `# noqa: S608` and `# noqa: BLE001`
+# were inert. `RUF` catches the dead noqa comments that inertness leaves behind.
+select = ["E", "F", "I", "UP", "B", "SIM", "S", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]   # asserts are the point of a test
+
+[tool.mypy]
+strict = true
+# R1: tests were excluded, so every `# type: ignore[...]` written in a test below was
+# checked by nothing. Either check them or delete them; this checks them.
+files = ["src/bok_core", "tests", "examples"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=bok_core --cov-report=term-missing --cov-fail-under=85"
