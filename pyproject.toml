@@ -26,12 +26,22 @@ build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# R1: ruff 0.16 formats fenced ```python blocks inside Markdown by default, so an
+# unscoped `ruff format --check .` reformats CLAUDE.md, docs/INTERFACE-CONTRACT.md and
+# the plan/spec docs -- none of which are this package's source and none of which this
+# task may rewrite. Scope both check and format to the code this repo actually owns.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 # R1: `S` (flake8-bandit) added. This is security tooling and the lint set carried no
 # security rules at all -- which is why the plan's own `# noqa: S608` and `# noqa: BLE001`
 # were inert. `RUF` catches the dead noqa comments that inertness leaves behind.
 select = ["E", "F", "I", "UP", "B", "SIM", "S", "RUF"]
+ignore = [
+  "UP046",  # prefer PEP 695 generics -- INTERFACE-CONTRACT.md's Labelled/Claim are
+            # documented and tested (pydantic 2.13.5) against `Generic[T]`; rewriting the
+            # class syntax would drift from the literal contract text for no behaviour change.
+]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]   # asserts are the point of a test
