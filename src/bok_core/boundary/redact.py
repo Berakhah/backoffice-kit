@@ -36,6 +36,7 @@ from __future__ import annotations
 import hmac
 import re
 import unicodedata
+from collections.abc import Callable, Iterator
 from hashlib import sha256
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -63,7 +64,8 @@ class RedactionFailed(Exception):
 # accepted exactly one of space/hyphen/dot, and digit groups split any other way passed
 # through with verified=True. The cost is over-redaction: rows of small numbers, prices,
 # dates and IP addresses become `account`/`card`/`digit_run` (declared in methodology.md).
-_GAP = r"[\s./\-]{0,3}"
+_GAP_CHAR = r"[\s./\-]"
+_GAP = rf"{_GAP_CHAR}{{0,3}}"
 
 # Person names and addresses need local NER (spaCy/GLiNER) and land in week 5. Until then
 # a document containing a person's name is not REDACTED; it is CLIENT_CONFIDENTIAL.
@@ -80,17 +82,18 @@ _MC = "".join(chr(cp) for cp in range(0x0900, 0x1D200) if unicodedata.category(c
 # ^ _ ` { | } ~, plus dots), quoted strings and parenthesised comments, as up to 64 items.
 # The round-3 class [\w.%+-] stopped at the first other atext character, so
 # "jane.o'connor@corp.test" left "jane.o'" behind.
-# Linear time: a match may only START within 256 characters of an "@" (a cheap lookahead
-# scanned in C; RFC 5321 caps a local part at 64 octets), and the repetition is
-# POSSESSIVE -- no item can consume an "@" except inside a quoted string or comment, so
-# giving items back can never expose a different "@". Without both, a run of '"' spent
-# seconds walking the alternation at every position.
-_LOCAL_PART = (
-    r"(?=[^@\r\n]{0,256}@)"
-    rf"(?:[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]"
-    r'|"[^"\r\n]{1,64}"'
-    r"|\([^()\r\n]{0,64}\)){0,64}+"
-)
+# Linear time: the repetition is POSSESSIVE -- no item can consume an "@" except inside
+# a quoted string or comment, so giving items back can never expose a different "@" --
+# and the scan is driven from each "@" (_find_emails), not from every position.
+# Quoted strings take quoted-pairs ("john\"smith"), comments one level of nesting
+# ("jonathan(a(b)c)"); the round-2 forms stopped at the backslash or the inner "(" and
+# left the start of the address behind.
+_QUOTED = r'"(?:[^"\\\r\n]|\\.){1,64}"'
+_COMMENT = r"\((?:[^()\r\n]|\([^()\r\n]{0,64}\)){0,64}\)"
+_LOCAL_PART = rf"(?:[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]|{_QUOTED}|{_COMMENT}){{0,64}}+"
+# A host name, or a domain literal: "jonathan@[192.168.0.1]" left "jonathan@[" and "]"
+# around an ACCOUNT surrogate, and "@[IPv6:2001:db8::1]" matched nothing at all.
+_DOMAIN = r"(?:[\w.-]{1,255}\.[A-Za-z]{2,63}|\[[^\[\]\r\n]{1,255}\])"
 
 _DETECTORS: dict[str, re.Pattern[str]] = {
     # No \b at either end: the local part may start mid-run ("...AAAAaaaa@a.test" after
@@ -98,7 +101,7 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
     # first match takes "a@a.test.aa"), and "ana@x.test12345678" ends at the TLD.
     # Every part is length-bounded (RFC 5321: local 64, domain 255, label 63), which also
     # keeps the scan linear on a long run of word characters with no "@".
-    "email": re.compile(_LOCAL_PART + r"@[\w.-]{1,255}\.[A-Za-z]{2,63}"),
+    "email": re.compile(rf"{_LOCAL_PART}@{_DOMAIN}"),
     # Grouped in fours, every group -- the trailing 1-4 character group included --
     # preceded by the same 0-3 character gap the digit detectors accept, so one shape
     # covers compact (NL91ABNA0417164300: zero gaps), spaced, GB82-WEST-1234-...,
@@ -162,11 +165,27 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
 # halves were needed: with a guard alone, "GB 00 00000AAA...A0" glued to "a@a.test"
 # matched nothing and left "GB 00" behind; with the guarded half tried first, the first
 # boundary won and "GB00 0000AAAAAAA AAAA...A" kept its tail.
+_BBAN = rf"(?:(?:{_GAP}[A-Z0-9]){{30}}|(?:{_GAP}[A-Z0-9]){{11,29}}(?![A-Z0-9]))"
 _IBAN_NATIONAL = re.compile(
-    rf"(?:(?-i:[A-Z]{{2}})[\s./\-]{{1,3}}|[A-Z]{{2}})\d{{2}}"
-    rf"(?:(?:{_GAP}[A-Z0-9]){{30}}|(?:{_GAP}[A-Z0-9]){{11,29}}(?![A-Z0-9]))",
-    re.IGNORECASE,
+    rf"(?:(?-i:[A-Z]{{2}}){_GAP_CHAR}{{1,3}}|[A-Z]{{2}})\d{{2}}{_BBAN}", re.IGNORECASE
 )
+# A gapped country code of ANY case ("gb 82 west 1234 ...", "Gb 82 ...", "nl 91 abna
+# 0417164300") is accepted when the BBAN is digit-heavy: at least 8 digits among its
+# 11-30 letters/digits (_digit_heavy). Real BBANs carry an account number; prose such as
+# "on 12 March 2026 we left" does not, and stays untouched. The code must also be a word
+# of its own (not after a letter): without that, "ref 4111 1111 1111 1111" and
+# "phone 555 010-0100" became "r[IBAN]" and "pho[IBAN]". The cost, declared: such a code
+# glued directly after a letter ("...testgb 82 west 1234 ...") is not recognised.
+_IBAN_NATIONAL_ANY_CASE = re.compile(
+    rf"(?<![A-Z])[A-Z]{{2}}{_GAP_CHAR}{{1,3}}\d{{2}}{_BBAN}", re.IGNORECASE
+)
+_MIN_BBAN_DIGITS = 8
+
+
+def _digit_heavy(match: str) -> bool:
+    # The match's first two digits are the check digits; the rest are the BBAN's.
+    return sum(ch.isdigit() for ch in match) - 2 >= _MIN_BBAN_DIGITS
+
 
 # Kinds whose identity is the digits alone: the HMAC input drops every separator, so
 # "555-010-0100" and "(555) 010 0100" share one surrogate and joins survive layout.
@@ -182,22 +201,84 @@ _DIGIT_KINDS = frozenset({"phone", "digit_run", "card", "tax_id", "routing", "ac
 # ("ST12345698765432 now" inside "GB82WEST12345698765432 now"), widening the span into a
 # merged span whose surrogate is context-specific. That loses a join; it never leaks and
 # never makes a false join. Bounded patterns only: one attempt per start position.
-def _overlapping(pattern: re.Pattern[str]) -> re.Pattern[str]:
-    return re.compile(rf"(?=({pattern.pattern}))", pattern.flags)
+Finder = Callable[[str], Iterator[tuple[int, int]]]
 
 
-# Every scan run over the text: (kind, pattern, overlapping). The supplementary IBAN
-# shape is scanned under kind "iban" and verified like any detector.
-_SCANS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
+def _finder(
+    pattern: re.Pattern[str],
+    *,
+    overlapping: bool = False,
+    keep: Callable[[str], bool] | None = None,
+) -> Finder:
+    """Spans of `pattern` in a text -- overlapping ones if asked (a match may start inside
+    another), and only those whose text passes `keep`."""
+    compiled = re.compile(rf"(?=({pattern.pattern}))", pattern.flags) if overlapping else pattern
+    group = 1 if overlapping else 0
+
+    def find(text: str) -> Iterator[tuple[int, int]]:
+        for m in compiled.finditer(text):
+            start, end = m.span(group)
+            if keep is None or keep(text[start:end]):
+                yield start, end
+
+    return find
+
+
+# How far before an "@" a quoted or commented local part may start (RFC 5321 caps a
+# local part at 64 octets; 256 leaves room for quoting). Declared in methodology.md.
+_EMAIL_LOOKBACK = 256
+# An unquoted local part: the run of local-part characters before the "@", at most 64.
+_LOCAL_CHAR = re.compile(rf"[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]")
+_LOCAL_LIMIT = 64
+# A run preceded by one of these may continue a quoted string, quoted-pair or comment.
+_QUOTING = frozenset('")\\')
+
+
+def _find_emails(text: str) -> Iterator[tuple[int, int]]:
+    """Email matches, driven from each "@" (str.find) instead of from every position.
+
+    Text without "@" costs one C-level find. For each "@" the start of the local part is
+    found by walking back over local-part characters (at most 64) and the pattern is
+    matched once there. Only when that run is preceded by a quote, ")" or backslash --
+    a quoted string or comment -- are the starts in [max(done, at - 256), at] tried
+    left to right. Each "@" costs O(local part), not O(window x local part): on a 1.1 MB
+    DOM snapshot the scan went from 0.9 s/pass (position-by-position) to milliseconds.
+    """
+    pattern = _DETECTORS["email"]
+    done = 0
+    at = text.find("@")
+    while at != -1:
+        start = at
+        floor = max(done, at - _LOCAL_LIMIT)
+        while start > floor and _LOCAL_CHAR.match(text, start - 1):
+            start -= 1
+        m = None
+        if start > done and text[start - 1] in _QUOTING:
+            for candidate in range(max(done, at - _EMAIL_LOOKBACK), at + 1):
+                m = pattern.match(text, candidate)
+                if m is not None:
+                    break
+        if m is None:
+            m = pattern.match(text, start)
+        if m is not None:
+            yield m.start(), m.end()
+            done = m.end()
+        else:
+            done = at + 1
+        at = text.find("@", max(done, at + 1))
+
+
+# Every scan run over the text, under its kind. The supplementary IBAN shapes are scanned
+# under kind "iban"; verification runs the same finders.
+_SCANS: tuple[tuple[str, Finder], ...] = (
     *(
-        (kind, _overlapping(pattern), True) if kind == "iban" else (kind, pattern, False)
+        (kind, _find_emails)
+        if kind == "email"
+        else (kind, _finder(pattern, overlapping=kind == "iban"))
         for kind, pattern in _DETECTORS.items()
     ),
-    ("iban", _overlapping(_IBAN_NATIONAL), True),
-)
-_VERIFY: tuple[tuple[str, re.Pattern[str]], ...] = (
-    *_DETECTORS.items(),
-    ("iban", _IBAN_NATIONAL),
+    ("iban", _finder(_IBAN_NATIONAL, overlapping=True)),
+    ("iban", _finder(_IBAN_NATIONAL_ANY_CASE, overlapping=True, keep=_digit_heavy)),
 )
 _RANK = {kind: rank for rank, kind in enumerate(_DETECTORS)}
 
@@ -277,6 +358,7 @@ _LOOKALIKE: dict[int, str] = {
         "-",
     ),  # box drawings horizontals
     **dict.fromkeys((0x2578, 0x257A, 0x257C, 0x257E), "-"),
+    0x2550: "-",  # box drawings double horizontal (vertical/corner forms are not mapped)
 }
 
 # Removed outright: lone surrogates (Cs -- they reach Python from JavaScript strings via
@@ -353,11 +435,8 @@ def _merged_spans(text: str) -> list[tuple[int, int, str, bool]]:
     False when other matches widened it (a merged span) -- see _hmac_input.
     """
     found: list[tuple[int, int, int, str]] = []
-    for kind, pattern, overlapping in _SCANS:
-        group = 1 if overlapping else 0
-        found.extend(
-            (m.start(group), m.end(group), _RANK[kind], kind) for m in pattern.finditer(text)
-        )
+    for kind, find in _SCANS:
+        found.extend((start, end, _RANK[kind], kind) for start, end in find(text))
     found.sort()
 
     # (start, end, label, missed, label_start, label_end)
@@ -454,7 +533,7 @@ def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult:
 
     # VERIFICATION. Re-run every detector, including any substitution skipped. A detector
     # firing on the OUTPUT means an identifier of that class survived.
-    failures = sorted({kind for kind, pattern in _VERIFY if pattern.search(text)})
+    failures = sorted({kind for kind, find in _SCANS if next(find(text), None) is not None})
 
     return RedactionResult(
         text=text,

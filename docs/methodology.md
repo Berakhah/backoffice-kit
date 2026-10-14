@@ -12,10 +12,10 @@ that every kind named there is also named here.
 
 | `00` §4.2 class | Status | Detector kind(s) | Shapes recognised (after normalisation, below) |
 |---|---|---|---|
-| Emails | Covered (ASCII TLD) | `email` | `local@domain.tld`. The local part follows RFC 5322: atext (letters, digits and ``! # $ % & ' * + - / = ? ^ _ ` { | } ~``, plus dots), quoted strings (`"john smith"`), parenthesised comments (`ana(comment)`), and Unicode letters including spacing marks (`Mc`, so Devanagari EAI local parts are covered). It is up to 64 items and may be empty, so a bare `@domain.tld` residue is also redacted. The TLD must be ASCII letters |
+| Emails | Covered (ASCII TLD) | `email` | `local@domain.tld`. The local part follows RFC 5322: atext (letters, digits and ``! # $ % & ' * + - / = ? ^ _ ` { | } ~``, plus dots), quoted strings with quoted-pairs (`"john smith"`, `"john\"smith"`), parenthesised comments with one level of nesting (`ana(comment)`, `jonathan(a(b)c)`), and Unicode letters including spacing marks (`Mc`, so Devanagari EAI local parts are covered). It is up to 64 items and may be empty, so a bare `@domain.tld` residue is also redacted. The TLD must be ASCII letters, or the domain is a literal (`jonathan@[192.168.0.1]`, `jonathan@[IPv6:2001:db8::1]`) |
 | Phones | Covered (NANP shape) | `phone` | optional `+CC` (1–3 digits) prefix; `(ddd)` or `ddd`; then `ddd` and `dddd`, each gap independent (`555-010-0100`, `555 010-0100`, `555/010.0100`, `5550100100`) |
 | Tax ids | Covered (US shapes only) | `tax_id` | EIN `12-3456789`; SSN/ITIN `123-45-6789` (hyphenated; other layouts are still caught as digit runs) |
-| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or in groups of four with the same gap before every group, the trailing 1–4 character group included (`GB82 WEST 1234 5698 7654 32`, `GB82-WEST-1234-5698-7654-32`, `MT84  MALT  0110  0001  2345  MTLC  AST0  01S`, `GB82WEST 1234 ...`); plus **national display formats** with groups of any width: an optional gap between country code and check digits, then 11–30 letters/digits each optionally preceded by a gap (`IT60 X 05428 11101 000000123456`, `FR76 30006 00001 12345678901 89`, `MT84 MALT 01100 0012345MTLCAST001S`, `GB 82 WEST ...`). When the code and check digits are separated by a gap, the code must be upper case (`iban`) |
+| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or in groups of four with the same gap before every group, the trailing 1–4 character group included (`GB82 WEST 1234 5698 7654 32`, `GB82-WEST-1234-5698-7654-32`, `MT84  MALT  0110  0001  2345  MTLC  AST0  01S`, `GB82WEST 1234 ...`); plus **national display formats** with groups of any width: an optional gap between country code and check digits, then 11–30 letters/digits each optionally preceded by a gap (`IT60 X 05428 11101 000000123456`, `FR76 30006 00001 12345678901 89`, `MT84 MALT 01100 0012345MTLCAST001S`, `GB 82 WEST ...`). When the code and check digits are separated by a gap, the code must be upper case, or of any case when it stands as a word of its own and the BBAN has at least 8 digits (`gb 82 west 1234 ...`, `nl 91 abna 0417164300`) (`iban`) |
 | Addresses | **NOT covered** | `address` (declared, no detector) | — |
 | Person names | **NOT covered** | `person_name` (declared, no detector) | — |
 
@@ -56,8 +56,8 @@ text — all of it, not only the identifiers** (see "Output text" below):
    - slashes U+2044, U+2215, U+29F8 and U+2571 → `/`;
    - full stops and dots U+3002 (U+FF61 decomposes to it), U+06D4, U+2E3C, U+00B7,
      U+2022, U+2027, U+2219 and U+30FB → `.`;
-   - dash-likes U+30FC (with U+FF70), U+02D7, U+2043, U+2796, U+23AF and the box-drawing
-     horizontals → `-`.
+   - dash-likes U+30FC (with U+FF70), U+02D7, U+2043, U+2796, U+23AF, the box-drawing
+     horizontals and the double horizontal U+2550 → `-`.
 
    NFKD already folds U+FF0F, U+FF0E, U+2024 and U+FE52 to ASCII.
 5. NFC, which only recomposes what is left (Hangul syllables).
@@ -123,10 +123,17 @@ are equal.
 
 <!-- declared-gaps:start -->
 - Addresses and person names: no detector yet (a local NER model is planned for week 5).
-- Digit groups split by `,` `'` `:` `|` `_` `;`, U+066B or U+066C, or by any other character outside the gap set and its mapped lookalikes. Box-drawing verticals and corners, and dingbat slashes and dashes not in `_LOOKALIKE`, are not mapped.
+- Digit groups split by `,` `'` `:` `|` `_` `;`, U+066B or U+066C, or by any other character outside the gap set and its mapped lookalikes. Not mapped: box-drawing verticals and corners (e.g. U+2502, U+2551, U+250C), and dingbat slashes and dashes not listed in `_LOOKALIKE`.
 - Gaps of 4 or more gap characters between digit groups.
 - Account numbers shorter than 8 digits. Non-US tax ids and non-NANP phone layouts are not detected as such, though their runs of 8+ digits are still caught.
-- Emails with an IDN or non-ASCII TLD, emails with comments or quoted strings in the domain part, and local parts of more than 64 items or starting more than 256 characters before the `@`.
+- Emails:
+  - with an IDN or non-ASCII TLD;
+  - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
+  - with comments nested more than one level deep.
+- Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A quoted or commented local part starting more than 256 characters before its `@` is also not matched.
+- A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
+- A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), its letters can survive; the digits are still redacted.
+- Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
 - Digit-valued `No` characters without an NFKD digit form: dingbat negative-circled digits (U+2776-U+277F), double-circled digits (U+24F5-U+24FE), Ethiopic (U+1369-U+137C), Kharoshthi (U+10A40-U+10A48), Brahmi (U+11052-U+11065), Rumi (U+10E60-U+10E7E), and similar.
 <!-- declared-gaps:end -->
 
@@ -169,7 +176,8 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
   - `SC52 BAHL ... USD and more` loses `and more`.
 
   The span's surrogate is then context-specific: the join is lost, but nothing leaks.
-  Lower-case prose such as `on 12 March 2026` is not affected.
+  Lower-case prose such as `on 12 March 2026` is not affected: a lower-case gapped code
+  needs at least 8 digits after it.
 - **Glued identifiers:** identifiers glued together with no separator are redacted (no
   fragment of either survives, property-tested), but they merge into one span with one
   surrogate.

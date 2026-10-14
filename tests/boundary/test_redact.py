@@ -222,32 +222,58 @@ def test_digit_runs_longer_than_a_card_are_still_redacted() -> None:
         assert not _fragments(run) & _fragments(_leftover(r.text)), run
 
 
+# Repeating units, each tiled to a target length. The test ids are the names, never the
+# values: Windows caps the env var in which pytest stores the current test id.
 _HOSTILE = {
-    "word_run": "a" * 200_000,
-    "dotted_run": "a." * 100_000,
-    "iban_prefix_run": "GB12" * 50_000,
-    "digit_run": "1" * 200_000,
-    "spaced_digits": "1 " * 100_000,
-    "long_upper": "AB12" + "A" * 200_000,
-    "at_signs": "a@" * 100_000,
-    "paren_groups": "(123)" * 40_000,
-    "double_quotes": '"' * 200_000,
-    "open_parens": "(" * 200_000,
-    "apostrophes": "a'" * 100_000,
-    "atext_run": "!#$%&'*+/=?^_`{|}~-" * 10_000,
-    "iban_national_run": "GB 82 " * 40_000,
+    "word_run": "a",
+    "dotted_run": "a.",
+    "iban_prefix_run": "GB12",
+    "digit_run": "1",
+    "spaced_digits": "1 ",
+    "long_upper": "A",
+    "at_signs": "a@",
+    "paren_groups": "(123)",
+    "double_quotes": '"',
+    "open_parens": "(",
+    "apostrophes": "a'",
+    "atext_run": "!#$%&'*+/=?^_`{|}~-",
+    "iban_national_run": "GB 82 ",
+    "quote_letter": '"a',
+    "quoted_letter_at": '"a"@',
+    "escaped_quotes": '"\\"',
+    "nested_comment": "((a)",
+    "comment_at": "(a)@",
+    "quoted_at_62": '"' + "a" * 62 + '@"',
+    "domain_literal": "a@[",
+    "local_64_then_dots": "a" * 64 + "@" + "a." * 120,
+    "ab12_words": "ab12 ",
+    "gapped_lower_cc": "gb 82 ",
+    "upper_gapped": "AA 00 ",
+    "html": '<td class="x-1 y_2">Ab12 cd34 @ ef.gh</td> ',
 }
 
 
-@pytest.mark.parametrize("name", sorted(_HOSTILE))  # ids, not 200k-char values: Windows
-def test_hostile_input_is_redacted_in_linear_time(name: str) -> None:  # caps env vars
-    """Every detector is length-bounded or unambiguous, so no input backtracks
-    quadratically. 'GB12' * 50_000 also used to fail closed (matched only at its end)."""
-    hostile = _HOSTILE[name]
-    started = time.perf_counter()
-    r = redact(_cc(hostile), key=KEY)
-    assert time.perf_counter() - started < 5.0
-    assert r.verified is True
+def _tile(unit: str, n: int) -> str:
+    return (unit * (n // len(unit) + 1))[:n]
+
+
+def _best_time(text: str, runs: int) -> float:
+    best = float("inf")
+    for _ in range(runs):
+        started = time.perf_counter()
+        redact(_cc(text), key=KEY)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+@pytest.mark.parametrize("name", sorted(_HOSTILE))
+def test_hostile_input_scales_linearly(name: str) -> None:
+    """10x the input must cost well under 20x the time. This is a ratio, not an absolute
+    bound: the redactor runs on whole DOM snapshots, so a super-linear regression must
+    fail here, but a slow CI machine must not. A run under 50 ms at 100k is not judged."""
+    small = _best_time(_tile(_HOSTILE[name], 10_000), runs=3)
+    large = _best_time(_tile(_HOSTILE[name], 100_000), runs=1)
+    assert large < 0.05 or large < 20 * max(small, 0.0025), (name, small, large)
 
 
 def test_a_short_key_is_refused_without_echoing_it() -> None:
@@ -554,6 +580,7 @@ def test_an_email_with_a_full_rfc5322_local_part_is_redacted_whole(email: str) -
         ("\uff70", "-"),  # halfwidth prolonged sound mark
         ("\u2500", "-"),  # box drawings light horizontal
         ("\u2501", "-"),  # box drawings heavy horizontal
+        ("\u2550", "-"),  # box drawings double horizontal
         ("\u2796", "-"),  # heavy minus sign
         ("\u02d7", "-"),  # modifier letter minus sign
         ("\u2043", "-"),  # hyphen bullet
@@ -644,8 +671,83 @@ def test_declared_gaps_match_between_methodology_and_contract() -> None:
     in_contract = _declared_gaps(docs / "INTERFACE-CONTRACT.md")
     assert in_methodology == in_contract
     joined = " ".join(in_methodology)
-    for named in ("U+2776", "Ethiopic", "Kharoshthi", "Brahmi", "Rumi", "IDN"):
+    for named in (
+        "U+2776",
+        "Ethiopic",
+        "Kharoshthi",
+        "Brahmi",
+        "Rumi",
+        "IDN",
+        "U+249C",
+        "64 characters",
+    ):
         assert named in joined, named
+
+
+# --- Task 8b fix round 1 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("layout", "compact"),
+    [
+        ("gb 82 west 1234 5698 7654 32", "GB82WEST12345698765432"),  # was "gb 82 west [CARD]"
+        ("Gb 82 WEST 1234 5698 7654 32", "GB82WEST12345698765432"),  # was "Gb 82 WE[IBAN]"
+        ("gB 82 west 1234 5698 7654 32", "GB82WEST12345698765432"),
+        ("gb 82 west12 3456 9876 5432", "GB82WEST12345698765432"),
+        ("it 60 x 05428 11101 000000123456", "IT60X0542811101000000123456"),
+        ("no 93 8601 1117 947", "NO9386011117947"),
+        ("be 68 539 0075 4703", "BE6853900754703"),
+        ("mt 84 malt 01100 0012345mtlcast001s", "MT84MALT011000012345MTLCAST001S"),
+        ("de 89 3704 0044 0532 0130 00", "DE89370400440532013000"),
+        ("nl 91 abna 0417 1643 00", "NL91ABNA0417164300"),
+        ("nl 91 abna 0417164300", "NL91ABNA0417164300"),
+    ],
+)
+def test_a_gapped_country_code_of_any_case_with_a_digit_heavy_bban_is_an_iban(
+    layout: str, compact: str
+) -> None:
+    r = redact(_cc(f"pay {layout}; now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"iban": 1}
+    assert _only_surrogate_left(r, "pay ", "; now"), r.text
+    assert r.text == redact(_cc(f"pay {compact}; now"), key=KEY).text
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        "on 12 March 2026 we left early",
+        "Go 12 rounds then rest a while",
+        "in 20 minutes we left the building",
+        "up 15 percent on the quarter again",
+    ],
+)
+def test_gapped_lower_case_prose_with_few_digits_is_left_alone(prose: str) -> None:
+    """The other direction: a lower/mixed-case gapped 'country code' needs >= 8 digits in
+    the 11-30 letters/digits that follow, so ordinary prose is not an IBAN."""
+    r = redact(_cc(prose), key=KEY)
+    assert r.text == prose
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        '"john\\"smith"@x.test',  # quoted-pair; was '"john\\[EMAIL]'
+        '"jonathan.\\"q\\".smith"@x.test',
+        "jonathan(a(b)c)@x.test",  # nested comment; was 'jonathan(a(b)c)[EMAIL]'
+        "jonathan(comment with (nest))@x.test",
+        "jonathan@[192.168.0.1]",  # domain literal; was 'jonathan@[[ACCOUNT]]'
+        "jonathan@[IPv6:2001:db8::1]",  # was untouched
+        '"john smith"(c)@x.test',
+    ],
+)
+def test_quoted_pairs_nested_comments_and_domain_literals_are_redacted_whole(
+    email: str,
+) -> None:
+    r = redact(_cc(f"mail {email} now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"email": 1}
+    assert _only_surrogate_left(r, "mail ", " now"), r.text
 
 
 # --- Properties -------------------------------------------------------------------------
@@ -685,16 +787,21 @@ def _iban(draw: st.DrawFn) -> str:
 
 
 @st.composite
-def _iban_national(draw: st.DrawFn) -> str:
+def _iban_national(draw: st.DrawFn, *, any_case_gapped: bool = False) -> str:
     """National display formats: country code, optional gap, check digits, then 11-30
-    letters/digits cut into groups of ANY width by covered gaps, either case."""
+    letters/digits cut into groups of ANY width by covered gaps, either case.
+
+    A gapped country code is upper case unless `any_case_gapped` and the BBAN is
+    digit-heavy (>= 8 digits). Any-case gapped codes go only into SEPARATED documents: glued
+    directly after a letter they are a declared gap (indistinguishable from "ref 4111")."""
     cc = draw(st.sampled_from(["GB", "gb", "MT", "IT", "Fr"]))
     check = draw(st.from_regex(r"[0-9]{2}", fullmatch=True))
     body = draw(st.from_regex(r"[A-Za-z0-9]{11,30}", fullmatch=True))
     cuts = sorted(set(draw(st.lists(st.integers(1, len(body) - 1), max_size=6))))
     pieces = [body[a:b] for a, b in zip([0, *cuts], [*cuts, len(body)], strict=True)]
     gap = draw(st.sampled_from(["", " ", "-"]))
-    cc = cc.upper() if gap else cc  # a gapped country code is printed upper-case
+    if gap and not (any_case_gapped and sum(ch.isdigit() for ch in body) >= 8):
+        cc = cc.upper()
     return f"{cc}{gap}{check}" + "".join(draw(_IBAN_GAP) + p for p in pieces)
 
 
@@ -703,15 +810,22 @@ _ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
 _EMAIL_LOCAL = st.one_of(
     st.from_regex(rf"{_ATEXT}{{1,10}}(\.{_ATEXT}{{1,6}})?", fullmatch=True),
     st.from_regex(r'"[a-z ]{1,8}"', fullmatch=True),
+    st.from_regex(r'"[a-z]{1,4}\\"[a-z ]{1,4}"', fullmatch=True),  # quoted-pair
     st.from_regex(r"[a-z]{1,4}\([a-z]{1,6}\)", fullmatch=True),
+    st.from_regex(r"[a-z]{1,4}\([a-z]{1,3}\([a-z]{1,3}\)[a-z]{0,3}\)", fullmatch=True),
+)
+
+_EMAIL_DOMAIN = st.one_of(
+    st.from_regex(r"[a-z]{1,8}\.test", fullmatch=True),
+    st.from_regex(r"\[[0-9]{1,3}(\.[0-9]{1,3}){3}\]", fullmatch=True),
+    st.from_regex(r"\[IPv6:[0-9a-f]{1,4}(:[0-9a-f]{1,4}){2,5}\]", fullmatch=True),
 )
 
 
 @st.composite
 def _email(draw: st.DrawFn) -> str:
     local = draw(_EMAIL_LOCAL)
-    domain = draw(st.from_regex(r"[a-z]{1,8}\.test", fullmatch=True))
-    return f"{local}@{domain}"
+    return f"{local}@{draw(_EMAIL_DOMAIN)}"
 
 
 _TAGGED = st.one_of(
@@ -816,7 +930,12 @@ def _assert_redacted(doc: str, tagged: list[tuple[str, str]], *, exact_kinds: bo
         assert r.surrogate_count == dict(expected)
 
 
-@given(tagged=st.lists(_TAGGED.flatmap(_noisy), min_size=1, max_size=6))
+_TAGGED_SEPARATED = st.one_of(
+    _TAGGED, st.tuples(st.just("iban"), _iban_national(any_case_gapped=True))
+)
+
+
+@given(tagged=st.lists(_TAGGED_SEPARATED.flatmap(_noisy), min_size=1, max_size=6))
 def test_separated_identifiers_are_each_redacted_whole_and_classified(
     tagged: list[tuple[str, str]],
 ) -> None:
