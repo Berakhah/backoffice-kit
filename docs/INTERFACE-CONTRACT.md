@@ -382,6 +382,31 @@ def write_guarded(path: Path, payload: Labelled[bytes], plane: Plane,
 on failure) and by `agent-perimeter` (no raw secret ever persisted). Neither is a gateway concern.
 Consumers route their write paths through this rather than writing bespoke guards.
 
+As of 0.2.13 (Task 10, as built — `src/bok_core/boundary/egress.py`; signatures unchanged):
+- **Fail closed on malformed input**, before any rule: an unknown plane or sensitivity
+  label raises `SensitivityViolation` (a member's string value, e.g. `"CLIENT_CONFIDENTIAL"`,
+  is read as that member — `Labelled` validates nothing, and identity checks against a raw
+  string would all have been False); a payload value that is not `bytes`, or a `redaction`
+  that is not a `RedactionResult`, raises `TypeError`.
+- **REDACTED is refused to every plane that is not CLIENT** (today: DEMO).
+- **A REDACTED payload is written only as the bytes of a verified `RedactionResult`.**
+  Three refusals added after "verification did not pass": a `RedactionResult` attached to a
+  payload NOT labelled REDACTED (relabelling redacted client text PUBLIC would launder it
+  onto DEMO); a REDACTED payload whose bytes are not `result.text.encode("utf-8")` (a
+  verified result for one document vouches for nothing else); and **re-verification** —
+  every detector is re-run over the text, because `RedactionResult` is a plain model and
+  `verified=True` can be hand-built. The supported route is
+  `Labelled(result.labelled().value.encode("utf-8"), Sensitivity.REDACTED)` with
+  `redaction=result`. Re-verification costs one detection pass over the text (measured: 0.34 s for a 1.1 MB redacted table-row DOM, vs 1.85 s for `redact()` itself).
+- **Errors** name the rule, the label, the plane, the path and detector kinds — never
+  payload content. Nothing in `egress` logs.
+- **`write_guarded` is atomic**: a uniquely named temporary file in the target's directory
+  (`mkstemp`, mode 0600 where honoured), flushed and fsynced, then `os.replace`d over the
+  target; the temporary file is removed on any failure, so neither a half-written target nor
+  a stray partial file is left. (The plan's fixed `<name>.partial` name clobbered any file
+  of that name and raced between concurrent writers.)
+- Not in scope: symlinked targets and the template's `test_no_unguarded_writes` AST scan.
+
 ---
 
 ## 2. `bok_core.provenance`
@@ -977,6 +1002,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.13 | 2026-10-14 | **§1.5 `egress` — Task 10, as built. No signature changes.** `Plane`, `guard_write`, `write_guarded` implemented. Beyond the four contracted refusals: (1) fail closed on an unknown plane or sensitivity label (`SensitivityViolation`) and on a non-bytes payload or non-`RedactionResult` redaction (`TypeError`); (2) a `RedactionResult` attached to a non-REDACTED payload is refused; (3) a REDACTED payload must be exactly `result.text` as UTF-8; (4) the guard re-runs every detector over that text (`redact._detected_kinds`, now shared with `redact()`'s own verification), so a hand-built `verified=True` is not trusted. `write_guarded` writes via a unique `mkstemp` file + fsync + `os.replace`, removing the temporary on failure. Errors carry rule, label, plane, path and kinds only; egress never logs. |
 | 0.2.12 | 2026-10-14 | **§1.3 `redact` — Task 8b breaker ruling (carried into Task 10). No symbol changes.** (1) A quoted string whose content starts, after optional whitespace and brackets (and backslashes in the escaped forms), with `:` or `,` is never a quoted local part; 0.2.11 excluded only punctuation-only strings, so separators holding a number, boolean, null, array or object (`": 1, "`, `": 7}, "`) swallowed neighbouring keys/values and `{"a": [1, "ana@x.test"]}` redacted to invalid JSON with verified=True (`["jonathan", {"a": 1}, "smith@x.test"]` was a regression vs 0.2.10). (2) Declared gap: quoted local parts starting with `,` or `:` (`",jo"@x.test`). (3) Corrected false claims of 0.2.11: "never joins a key or a previous value to an address" (now true for every JSON separator) and "valid JSON at the outer layer" (now qualified: not when a JSON number literal of 8+ digits is itself an identifier — it becomes an unquoted surrogate). (4) Properties: random JSON trees with numbers, booleans, null and nested arrays/objects as neighbouring values keep their structure and non-string values; the lookaheads are pinned directly. |
 | 0.2.11 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 5. No symbol changes.** (1) Normalisation decodes the one-layer JSON escapes `\b` (removed) and `\/` (→ `/`) as a decoder would, only after an even backslash run (`\\b`, `\\/` untouched); a backspace-split card, IBAN or account and `\b`/`\/` inside emails had kept identifiers with verified=True. `\b`/`\/` leave the gap-escape set. (2) A quoted string that is a JSON separator (whitespace and brackets around `:` or `,`) is not a quoted local part: `{"k": "ana@x.test"}` had become `{"[EMAIL:…]"}`. (3) The "redacted JSON stays valid JSON" claim is qualified to the outer layer. (4) Declared over-redaction: JSON-newline-separated short numbers join into one account. (5) Performance rows refreshed (`"a"(b)`) and added (`GB12`, `GB12\t`). |
 | 0.2.10 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 4. No symbol changes; contract NARROWED.** (1) `redact()` is specified over decoded text plus one layer of JSON string escaping. Twice-encoded JSON is covered only for quoted local parts without an inner escaped quote (0.2.9 implied more); HTML entities, `\uXXXX`/`\xXX` escapes and percent-encoding are not decoded. Callers MUST redact string values before serialising or encoding them. (2) Spans are widened to whole escape sequences, so redacting a valid JSON document yields valid JSON (property-tested, `ensure_ascii` on and off). (3) The depth-1 JSON property is the guarantee; a depth-2 property covers the declared shape, and the depth-2 inner-quote case is pinned as a declared gap. (4) `test_hostile_input_scales_linearly` is stabilised (gc off while timing, warm-up, best-of over up to 3 rounds); a quadratic scan still fails it at ~85x. (5) The performance table gains the `\@` row (14.3 s/MB, linear). (6) The JSON escapes `\t` `\n` `\r` `\f` `\b` `\/` are gap characters between digit and IBAN groups (one layer of JSON escaping); a TAB-separated card in JSON text had passed unredacted with verified=True. |

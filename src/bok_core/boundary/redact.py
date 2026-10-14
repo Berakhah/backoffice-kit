@@ -755,6 +755,13 @@ class RedactionResult(BaseModel):
         return Labelled(self.text, Sensitivity.REDACTED)
 
 
+def _detected_kinds(text: str) -> list[str]:
+    """The verification pass: every covered kind that a detector still finds in `text`,
+    sorted, never the matched text. egress.guard_write re-runs it over the bytes it is
+    asked to write, so a hand-built RedactionResult(verified=True) vouches for nothing."""
+    return sorted({kind for kind, find in _SCANS if next(find(text), None) is not None})
+
+
 def _hmac_input(kind: str, original: str, *, standalone: bool = True) -> str:
     """A standalone identifier is keyed on its CANONICAL form, so it shares a surrogate
     across layouts and case. A MERGED span is keyed on its full normalised text: a
@@ -800,7 +807,7 @@ def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult:
 
     # VERIFICATION. Re-run every detector, including any substitution skipped. A detector
     # firing on the OUTPUT means an identifier of that class survived.
-    failures = sorted({kind for kind, find in _SCANS if next(find(text), None) is not None})
+    failures = _detected_kinds(text)
 
     return RedactionResult(
         text=text,
