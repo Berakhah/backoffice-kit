@@ -1265,8 +1265,8 @@ def _local_part_words_are_gone(prefix: str, email: str, suffix: str, depth: int)
             document = json.dumps(document)
         r = redact(_cc(document), key=KEY)
         assert r.verified is True, r.failures
-        for word in words:
-            assert word not in r.text, (document, r.text)
+        for word in words:  # surrogates are letters a-p: "aaaa" can occur inside one
+            assert word not in _leftover(r.text), (document, r.text)
 
 
 # Every covered local-part shape EXCEPT a quoted string with an inner escaped quote
@@ -1380,3 +1380,67 @@ def test_redacted_json_evidence_stays_parseable(obj: dict[str, str], ensure_asci
     loaded = json.loads(r.text)
     assert isinstance(loaded, dict)
     assert loaded.keys() == obj.keys()
+
+
+# One layer of JSON escaping includes the two-character escapes of whitespace and slash:
+# DOM table innerText is TAB-separated, and json.dumps writes a TAB as backslash + "t".
+_TAB, _LF, _CR = chr(9), chr(10), chr(13)
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        (_TAB.join(["4111", "1111", "1111", "1111"]), "card"),
+        (_LF.join(["4111", "1111", "1111", "1111"]), "card"),
+        (_CR + _LF + "4111" + _CR + _LF + "1111 1111" + _TAB + "1111", "card"),
+        ("4111/1111/1111/1111", "card"),
+        (_TAB.join(["GB82", "WEST", "1234", "5698", "7654", "32"]), "iban"),
+        (_LF.join(["IT60 X", "05428", "11101", "000000123456"]), "iban"),
+        ("555" + _TAB + "010" + _TAB + "0100", "phone"),
+        ("(555)" + _LF + "010-0100", "phone"),
+        (_TAB.join(["12", "34", "56", "78"]), "account"),
+    ],
+)
+def test_json_escaped_whitespace_between_groups_is_a_gap(value: str, kind: str) -> None:
+    """json.dumps({"k": "4111<TAB>1111<TAB>1111<TAB>1111"}) is '4111' + backslash-t + ...:
+    one layer of JSON escaping, so it is covered. It passed fully unredacted with
+    verified=True; the escapes \\t \\n \\r \\f \\b and \\/ are now gap characters."""
+    import bok_core.boundary.redact as m
+
+    document = json.dumps({"k": f"pay {value}; now"})  # ";": an IBAN absorbs a short word
+    r = redact(_cc(document), key=KEY)
+    assert r.verified is True, r.failures
+    assert kind in r.surrogate_count, (document, r.text)
+    decoded = json.loads(r.text)["k"]
+    assert decoded.startswith("pay ") and decoded.endswith("; now"), decoded
+    assert not _fragments(m._normalise(value)) & _fragments(_leftover(decoded)), decoded
+
+
+def test_a_json_escaped_iban_keeps_its_plain_surrogate() -> None:
+    """The escape is a separator, not part of the IBAN: the canonical form drops it, so
+    the TAB-separated IBAN in JSON joins with the same IBAN in plain text."""
+    plain = redact(_cc("pay GB82 WEST 1234 5698 7654 32; now"), key=KEY).text
+    value = _TAB.join(["GB82", "WEST", "1234", "5698", "7654", "32"])
+    in_json = json.loads(redact(_cc(json.dumps({"k": f"pay {value}; now"})), key=KEY).text)["k"]
+    assert in_json == plain
+
+
+@settings(max_examples=300, deadline=None)
+@given(tagged=st.lists(_TAGGED_SEPARATED, min_size=1, max_size=5))
+def test_identifiers_in_json_evidence_are_redacted_whole(tagged: list[tuple[str, str]]) -> None:
+    """The depth-1 guarantee for every kind, not only emails: identifiers whose groups
+    are separated by TAB, LF or CR (the strategies' separators include them) are written
+    by json.dumps as two-character escapes. No 4-character fragment may survive in the
+    DECODED redacted value, and the document must still parse."""
+    import bok_core.boundary.redact as m
+
+    text = "<< " + " ; ".join(v for _, v in tagged) + " >>"
+    for document in (json.dumps({"k": text}), json.dumps([text, "x"])):
+        r = redact(_cc(document), key=KEY)
+        assert r.verified is True, r.failures
+        loaded = json.loads(r.text)
+        decoded = loaded["k"] if isinstance(loaded, dict) else loaded[0]
+        left = _leftover(decoded)
+        for _, value in tagged:
+            normal = m._normalise(value)
+            assert not _fragments(normal) & _fragments(left), (document, decoded)

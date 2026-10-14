@@ -132,9 +132,9 @@ are equal.
   - with comments nested more than one level deep.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read so that a quoted local part inside a JSON string is redacted. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, and the two-character escapes `\t` `\n` `\r` `\f` `\b` `\/` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered). Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
-  - Other escape sequences are not decoded: `\t` `\n` `\r` `\/`, `\uXXXX` and `\xXX`. In serialised text, identifier groups separated by one are not joined (a card whose groups are separated by an escaped TAB; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
+  - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
 - A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
@@ -227,6 +227,15 @@ backslash (`{"dom": "\[EMAIL:...]"}`), and an account starting inside `\u00e9` l
 succeeds on the redacted form of random JSON objects holding covered identifiers. The
 cost is up to 5 extra characters per side (over-redaction), and a JSON-escaped address's
 surrogate covers its escaping backslash, so it differs from the plain address's.
+
+**JSON whitespace escapes are gap characters.** DOM table innerText is TAB-separated,
+and `json.dumps` writes a TAB as `\t`: `4111\t1111\t1111\t1111` passed fully
+unredacted with verified=True. The two-character escapes `\t` `\n` `\r` `\f` `\b` and
+`\/` now each count as one gap character (same 0–3 bound) between digit and IBAN groups.
+A property puts every identifier kind, with TAB/LF/CR separators, into
+`json.dumps({"k": t})` / `json.dumps([t, "x"])` and checks that no 4-character
+fragment survives in the decoded redacted value. Over-redaction grows accordingly: lines
+of short numbers in JSON text (`12\n34\n56\n78`) become one `account`.
 
 ### Performance (measured; Python 3.12, Windows, one core)
 

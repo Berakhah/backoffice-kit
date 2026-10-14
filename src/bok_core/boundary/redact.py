@@ -65,7 +65,13 @@ class RedactionFailed(Exception):
 # accepted exactly one of space/hyphen/dot, and digit groups split any other way passed
 # through with verified=True. The cost is over-redaction: rows of small numbers, prices,
 # dates and IP addresses become `account`/`card`/`digit_run` (declared in methodology.md).
-_GAP_CHAR = r"[\s./\-]"
+# A gap character is also a JSON two-character escape of whitespace or slash (backslash +
+# t, n, r, f, b or /): the contract covers ONE layer of JSON string escaping, and DOM
+# table innerText is TAB-separated, so json.dumps of "4111<TAB>1111<TAB>..." wrote
+# '4111' + backslash-t + '1111' ... and the card passed fully unredacted with
+# verified=True. Each escape counts as ONE gap character (same 0-3 bound).
+_JSON_GAP_ESCAPE = r"\\[tnrfb/]"
+_GAP_CHAR = rf"(?:[\s./\-]|{_JSON_GAP_ESCAPE})"
 _GAP = rf"{_GAP_CHAR}{{0,3}}"
 
 # Person names and addresses need local NER (spaCy/GLiNER) and land in week 5. Until then
@@ -225,10 +231,14 @@ _IBAN_NATIONAL = re.compile(
 # of its own (not after a letter): without that, "ref 4111 1111 1111 1111" and
 # "phone 555 010-0100" became "r[IBAN]" and "pho[IBAN]". The cost, declared: such a code
 # glued directly after a letter ("...testgb 82 west 1234 ...") is not recognised.
+# A JSON whitespace escape before the code is a separator, not a letter: '\ngb 82 ...'
+# (a new line in JSON text) is a word of its own.
 _IBAN_NATIONAL_ANY_CASE = re.compile(
-    rf"(?<![A-Z])[A-Z]{{2}}{_GAP_CHAR}{{1,3}}\d{{2}}{_BBAN}", re.IGNORECASE
+    rf"(?:(?<![A-Z])|(?<={_JSON_GAP_ESCAPE}))[A-Z]{{2}}{_GAP_CHAR}{{1,3}}\d{{2}}{_BBAN}",
+    re.IGNORECASE,
 )
 _MIN_BBAN_DIGITS = 8
+_JSON_GAP_ESCAPE_RE = re.compile(_JSON_GAP_ESCAPE)
 
 
 def _digit_heavy(match: str) -> bool:
@@ -602,8 +612,9 @@ def _canonical(kind: str, identifier: str) -> str:
     """
     if kind in _DIGIT_KINDS:
         return "".join(ch for ch in identifier if ch.isdigit())
-    if kind == "iban":
-        return "".join(ch for ch in identifier if ch.isalnum()).upper()
+    if kind == "iban":  # a JSON escape is a separator: its letter is not part of the IBAN
+        bare = _JSON_GAP_ESCAPE_RE.sub("", identifier)
+        return "".join(ch for ch in bare if ch.isalnum()).upper()
     return identifier.lower()
 
 
