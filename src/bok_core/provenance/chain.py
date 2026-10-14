@@ -26,10 +26,15 @@ def derive[T](
     if not parents:
         raise ValueError("a DERIVED claim needs at least one parent")
 
-    scored = [p for p in parents if p.confidence is not None]
-    weakest = min(
-        scored, key=lambda p: p.confidence if p.confidence is not None else 1.0, default=None
+    # An unscored MODEL or DERIVED parent makes the child's confidence unknown (None):
+    # skipping it would let a scored sibling vouch for a reading nobody scored.
+    # DETERMINISTIC and HUMAN parents carry no confidence by design and do not lower the floor.
+    unknown = any(
+        p.confidence is None and p.method in (Method.MODEL, Method.DERIVED) for p in parents
     )
+    scored = [(p.confidence, p) for p in parents if p.confidence is not None]
+    floor = None if unknown else min(scored, key=lambda cp: cp[0], default=None)
+    weakest = floor[1] if floor else None
     when = observed_at or datetime.now(UTC)
 
     return Claim[T](
@@ -49,14 +54,20 @@ def inherited_caveats(claim: Claim) -> list[str]:  # type: ignore[type-arg]
     """Every caveat reachable from this claim: its own first, then ancestors' verbatim (I4).
 
     Computed by walking the parent DAG rather than copied down at derive() time, so a
-    caveat is never duplicated per hop and always carries its original wording. Pydantic revalidates
-    parents into fresh instances, so a shared ancestor is not the same object in each
-    branch (id() dedup fails); identical caveat text is therefore reported once.
+    caveat always carries its original wording. Pydantic revalidates parents into fresh
+    instances, so id() cannot identify a shared ancestor; structural identity
+    (model_dump_json, which includes the whole subtree) does. A diamond ancestor is
+    reported once, while two distinct ancestors that happen to share wording are both kept.
     """
     out: list[str] = []
+    seen: set[str] = set()
 
     def walk(node: Claim) -> None:  # type: ignore[type-arg]
-        if node.caveat and node.caveat not in out:
+        key = node.model_dump_json()
+        if key in seen:
+            return
+        seen.add(key)
+        if node.caveat:
             out.append(node.caveat)
         for parent in node.parents:
             walk(parent)

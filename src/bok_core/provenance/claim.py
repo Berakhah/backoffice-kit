@@ -68,8 +68,8 @@ class Claim(BaseModel, Generic[T]):
     # parametrisation time: Claim[Decimal] raises AttributeError: __pydantic_fields__
     # on pydantic 2.13.5, for list[Claim[object]] and list[Claim[Any]] alike, with or
     # without an explicit model_rebuild(). Verified on CPython 3.12, 29 Aug 2026.
-    # The bare form is also better semantics: it preserves parent identity through
-    # validation and keeps a parent's Decimal a Decimal instead of rebuilding it.
+    # NOTE: validation still revalidates parents into fresh instances (identity is NOT
+    # preserved), so use structural equality, never id(), to recognise a shared ancestor.
     parents: list[Claim] = []  # type: ignore[type-arg]
     caveat: str | None = None
 
@@ -89,6 +89,12 @@ class Claim(BaseModel, Generic[T]):
         # I1. R1: enforced HERE, not only in derive(). An invariant the contract says
         # bok-core enforces cannot live in a helper a caller can route around.
         if self.method is Method.DERIVED and self.confidence is not None:
+            # An unscored MODEL/DERIVED parent makes the child's confidence unknown.
+            if any(
+                p.confidence is None and p.method in (Method.MODEL, Method.DERIVED)
+                for p in self.parents
+            ):
+                raise ValueError("DERIVED confidence must be None when a parent is unscored")
             known = [p.confidence for p in self.parents if p.confidence is not None]
             if known and self.confidence > min(known) + 1e-9:
                 raise ValueError(

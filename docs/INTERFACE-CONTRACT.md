@@ -244,9 +244,8 @@ class Claim(BaseModel, Generic[T]):
 self-referencing *parametrised* field on a generic Pydantic model fails at parametrisation time:
 `Claim[Decimal]` raises `AttributeError: __pydantic_fields__` on pydantic 2.13 for both
 `list[Claim[object]]` and `list[Claim[Any]]`, with or without an explicit `model_rebuild()`
-(verified 29 Aug 2026, pydantic 2.13.5, CPython 3.12). The bare form works — and it is also the
-better semantics, because it preserves parent instance identity through validation and keeps a
-parent's `Decimal` a `Decimal` instead of revalidating it into a fresh object. `mypy --strict`
+(verified 29 Aug 2026, pydantic 2.13.5, CPython 3.12). The bare form works. Note that validation still revalidates parents into fresh instances, so parent
+instance identity is **not** preserved: recognise a shared ancestor by structural equality, never `id()`. `mypy --strict`
 reports `[type-arg]` on the bare form, so the field carries a one-line
 `# type: ignore[type-arg]` naming this reason.
 
@@ -277,6 +276,8 @@ source code" would be indistinguishable from "no bbox because extraction failed.
 | I5 | **`Claim[Decimal]` serialises `value` as a string, never a float** | `ledger-sense` §4.1.2 |
 | I6 | I1 and I4 hold at chain depth ≥ 5, over **branching** chains, not only linear ones | `ground-truth`, `ledger-sense` |
 | I7 | **`DERIVED` inherits unverified-ness.** `renders_as_fact()` is False if *any* ancestor is a `MODEL` claim that is not calibrated | all four |
+
+**None-confidence rule (I1).** An unscored (`confidence is None`) `MODEL` or `DERIVED` parent makes the derived child's confidence `None` (unknown); it is never skipped, because a scored sibling cannot vouch for a reading nobody scored. `DETERMINISTIC` and `HUMAN` parents carry no confidence by design, do not lower the floor, and are not treated as unknown. The `Claim` validator rejects a scored `DERIVED` claim with an unscored `MODEL`/`DERIVED` parent.
 
 **I1 and I7 are enforced by a validator on `Claim`, not only by the `derive()` helper.** v0.1 said
 these were *"enforced by bok-core"* while the only enforcement lived in a helper that a consumer
@@ -785,5 +786,6 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.1 | 2026-10-14 | **Clarifications, no symbol changes.** (1) `Claim.parents` bare annotation does NOT preserve parent instance identity (revalidation creates fresh instances); §2.1 corrected. (2) §2.3 states the None-confidence rule: unscored `MODEL`/`DERIVED` parent makes the child's confidence `None`; `DETERMINISTIC`/`HUMAN` do not lower the floor. |
 | 0.2 | 2026-08-29 | **Correctness revision.** Adds: `Sensitivity.rank`; `CallContext.redacted_opt_in` and `.max_verified_age`; `RedactionResult.labelled()`; `redact(key=)`; `egress.write_guarded()` and `guard_write(redaction=)`; invariant I7 (`DERIVED` inherits unverified-ness) and validator-enforced I1; `router.call(params=, timeout_s=, max_attempts=)` plus a mandatory order of operations; `governor.reserve()`, `Priority`, `backoff_delay(retry_after_s=, cap_s=)`; `ledger.from_cache` / `served_call_id` / `query(since=, until=, limit=)`; provider + params + schema fingerprint in the cache key; probe demotion and an SQLite-backed probe TTL; SARIF `properties.bok_provenance` / `bok_severity`; socket-level `blackout()`; `EmptyState.measuredNoun`; `PartialFailureState`; a single-rail provider; CSV injection neutralisation. Changes: `RedactionResult.surrogates` → `surrogate_count` (v0.1's map carried the plaintext PII it had just removed); `Claim.parents` annotated bare (`list[Claim[object]]` does not import under pydantic 2.13). Removes: nothing. |
 | 0.1 | 2026-08-27 | Initial contract. Adds beyond `00` §4/§5: `Claim.derivation`, `Claim.calibration`, `DocumentSource`, `RuleSource`, `DomSource`, `Claim[Decimal]` string serialisation, `Labelled` over bytes/handles, `boundary.fingerprint`, `boundary.egress`, the `Trust` axis, `CallContext.commercial`, `router(cache=DISABLED)`, `router(failover=DISABLED)`, `governor.remaining()`, ledger as a queryable table, `testing.degraded`. Removes: the shared `≥70%` degraded-mode assertion. |

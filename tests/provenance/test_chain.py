@@ -95,3 +95,69 @@ def test_derived_from_uncalibrated_model_does_not_render_as_fact() -> None:
     )
     assert not derive(2.0, [raw]).renders_as_fact()
     assert derive(2.0, [_model(0.9)]).renders_as_fact()
+
+
+def test_distinct_ancestors_with_identical_caveat_wording_are_both_kept() -> None:
+    a = Claim[float](
+        value=1.0,
+        source=ModelSource(ledger_call_id="a"),
+        method=Method.MODEL,
+        confidence=0.9,
+        calibration=CAL,
+        observed_at=NOW,
+        caveat="n=51",
+    )
+    b = Claim[float](
+        value=1.0,
+        source=ModelSource(ledger_call_id="b"),
+        method=Method.MODEL,
+        confidence=0.8,
+        calibration=CAL,
+        observed_at=NOW,
+        caveat="n=51",
+    )
+    assert inherited_caveats(derive(2.0, [a, b])).count("n=51") == 2
+
+
+def _unscored_model() -> Claim[float]:
+    return Claim[float](
+        value=1.0,
+        source=ModelSource(ledger_call_id="u"),
+        method=Method.MODEL,
+        confidence=None,
+        observed_at=NOW,
+    )
+
+
+def test_unscored_model_parent_makes_child_confidence_unknown() -> None:
+    child = derive(2.0, [_unscored_model(), _model(0.9)])
+    assert child.confidence is None
+    assert child.calibration is None
+
+
+def test_unscored_derived_parent_makes_child_confidence_unknown() -> None:
+    unknown = derive(2.0, [_unscored_model()])
+    assert derive(3.0, [unknown, _model(0.9)]).confidence is None
+
+
+@pytest.mark.parametrize("kind", ["human", "deterministic"])
+def test_deterministic_and_human_parents_do_not_lower_the_floor(kind: str) -> None:
+    exact = Claim[float](
+        value=1.0,
+        source=HumanSource(who="a", at=NOW),
+        method=Method.HUMAN if kind == "human" else Method.DETERMINISTIC,
+        observed_at=NOW,
+    )
+    assert derive(2.0, [exact, _model(0.7)]).confidence == pytest.approx(0.7)
+
+
+def test_claim_validator_rejects_scored_derived_over_unscored_model_parent() -> None:
+    with pytest.raises(ValueError, match="unscored"):
+        Claim[float](
+            value=1.0,
+            source=HumanSource(who="a", at=NOW),
+            method=Method.DERIVED,
+            confidence=0.9,
+            observed_at=NOW,
+            parents=[_unscored_model(), _model(0.9)],
+        )
