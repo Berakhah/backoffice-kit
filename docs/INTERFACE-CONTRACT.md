@@ -138,8 +138,21 @@ detector over the output**. Three corrections to v0.1, each closing a real hole:
    check was *"is any string I replaced still present in the output"* — a tautology, because
    replacement is what removed them. Absent a deliberately injected leak it could not fail, which
    made the single most important control in the system decorative. Verification now re-runs every
-   detector over the output and fails if any fires. That is what catches the real failure mode: an
-   identifier the first pass split, overlapped, or never had a pattern for.
+   detector over the output and fails if any fires. It catches an identifier a covered detector
+   **still recognises** in the output (a substitution skipped or failed, or a match exposed by a
+   neighbouring substitution). It **cannot** catch an identifier mangled into a shape no detector
+   recognises (an IBAN whose digit tail a phone match consumed), nor a class with no detector at
+   all. The mangling case is prevented structurally instead: all detectors run over the same text
+   and overlapping matches are merged and replaced whole (see `docs/methodology.md`).
+
+Further, as of 0.2.3:
+- `key` must be at least 32 bytes; a shorter key raises `ValueError` whose message never echoes it.
+- Input is normalised before detection (NFKC; Unicode spaces → space; Unicode dashes and U+2212 →
+  hyphen; format characters such as U+200B removed). **`text` is the normalised text**, and
+  surrogates are computed on the normalised identifier.
+- `RedactionResult.text` is excluded from `repr()`/`str()` (a failed result still holds the
+  surviving identifier). `model_dump()` includes it; a caller persisting an unverified result's
+  text treats it as `CLIENT_CONFIDENTIAL` and routes it through `egress`.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -794,6 +807,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.3 | 2026-10-14 | **§1.3 `redact` — no symbol changes; semantics tightened.** (1) The claim that verification catches "an identifier the first pass split, overlapped, or never had a pattern for" was wrong: verification only catches what a covered detector still recognises in the output. The mangling case is now prevented structurally (all detectors over the same text, overlapping spans merged and replaced whole). (2) `key` must be ≥ 32 bytes. (3) Input is Unicode-normalised before detection and `text` is the normalised text. (4) `RedactionResult.text` is excluded from `repr()`/`str()`. Coverage changes are declared in `docs/methodology.md`: added `digit_run` (20+ digits), `account` widened to 8–12 digits, spaced IBANs, and dot separators for cards. |
 | 0.2.2 | 2026-10-14 | **Clarification, no symbol changes.** §2.4 now states the `to_rail()` payload shape: `RailPayload` keys (`root`, `depth`, `inherited_caveats`) and the twelve `RailNode` keys, pinned by `tests/provenance/test_render.py` (`extra="forbid"`; a `Decimal` value is a JSON string; leaf depth is 1; shared ancestors nest under each child rather than being referenced by id). Recorded retroactively — the §2.4 text landed with Task 6 (bf5e2d4) without this row. |
 | 0.2.1 | 2026-10-14 | **Clarifications, no symbol changes.** (1) `Claim.parents` bare annotation does NOT preserve parent instance identity (revalidation creates fresh instances); §2.1 corrected. (2) §2.3 states the None-confidence rule: unscored `MODEL`/`DERIVED` parent makes the child's confidence `None`; `DETERMINISTIC`/`HUMAN` do not lower the floor. |
 | 0.2 | 2026-08-29 | **Correctness revision.** Adds: `Sensitivity.rank`; `CallContext.redacted_opt_in` and `.max_verified_age`; `RedactionResult.labelled()`; `redact(key=)`; `egress.write_guarded()` and `guard_write(redaction=)`; invariant I7 (`DERIVED` inherits unverified-ness) and validator-enforced I1; `router.call(params=, timeout_s=, max_attempts=)` plus a mandatory order of operations; `governor.reserve()`, `Priority`, `backoff_delay(retry_after_s=, cap_s=)`; `ledger.from_cache` / `served_call_id` / `query(since=, until=, limit=)`; provider + params + schema fingerprint in the cache key; probe demotion and an SQLite-backed probe TTL; SARIF `properties.bok_provenance` / `bok_severity`; socket-level `blackout()`; `EmptyState.measuredNoun`; `PartialFailureState`; a single-rail provider; CSV injection neutralisation. Changes: `RedactionResult.surrogates` → `surrogate_count` (v0.1's map carried the plaintext PII it had just removed); `Claim.parents` annotated bare (`list[Claim[object]]` does not import under pydantic 2.13). Removes: nothing. |
