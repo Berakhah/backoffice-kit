@@ -439,3 +439,72 @@ def test_a_non_os_failure_also_removes_the_temporary_file(
     with pytest.raises(KeyboardInterrupt):
         write_guarded(tmp_path / "e.html", Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
     assert list(tmp_path.iterdir()) == []
+
+
+# --- fix round 2: nothing payload- or directory-bearing anywhere in the exception chain --
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    seen: list[BaseException] = []
+    todo: list[BaseException | None] = [exc]
+    while todo:
+        e = todo.pop()
+        if e is None or any(e is s for s in seen):
+            continue
+        seen.append(e)
+        todo += [e.__cause__, e.__context__]
+    return seen
+
+
+def _chain_text(exc: BaseException) -> str:
+    parts: list[str] = []
+    for e in _chain(exc):
+        parts += [str(e), repr(e), repr(e.args)]
+        for attr in ("filename", "filename2", "object"):
+            parts.append(repr(getattr(e, attr, None)))
+    return " ".join(parts)
+
+
+def test_a_missing_directory_leaves_no_directory_in_the_exception_chain(tmp_path: Path) -> None:
+    """Fix round 2: `raise ... from None` keeps __context__, whose filename held the full
+    path. The replacement OSError is raised outside the except block."""
+    target = tmp_path / "acme-insurance" / "claim-AB12345678" / "dom.html"
+    with pytest.raises(OSError) as info:
+        write_guarded(target, Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
+    assert len(_chain(info.value)) == 1
+    text = _chain_text(info.value)
+    assert "acme" not in text and "AB12345678" not in text and str(tmp_path) not in text
+
+
+def test_a_failed_replace_leaves_no_directory_in_the_exception_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "acme-insurance"
+    folder.mkdir()
+
+    def boom(src: object, dst: object) -> None:
+        raise OSError(28, "disk full", str(src), None, str(dst))
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError) as info:
+        write_guarded(folder / "dom.html", Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
+    assert info.value.errno == 28
+    assert len(_chain(info.value)) == 1
+    assert "acme" not in _chain_text(info.value)
+
+
+def test_a_forged_lone_surrogate_is_refused_without_echoing_the_text(tmp_path: Path) -> None:
+    """Fix round 2: encoding a forged text holding a lone surrogate raised
+    UnicodeEncodeError, whose .object carried the whole forged text."""
+    forged = _forged(CONTENT + " \ud800", verified=True, failures=[])
+    path = tmp_path / "acme-insurance" / "dom.html"
+    for payload in (b"x", CONTENT.encode()):
+        with pytest.raises(SensitivityViolation, match="not the output of redact") as info:
+            write_guarded(
+                path, Labelled(payload, Sensitivity.REDACTED), Plane.CLIENT, redaction=forged
+            )
+        assert len(_chain(info.value)) == 1
+        text = _chain_text(info.value)
+        assert "dom.html" in text and "acme" not in text
+        for word in CONTENT_WORDS:
+            assert word not in text, text

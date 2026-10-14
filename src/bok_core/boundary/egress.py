@@ -123,7 +123,21 @@ def guard_write(
             f"payload, and this one is labelled {sensitivity}."
         )
 
-    if payload.value != redaction.text.encode("utf-8"):
+    # A lone surrogate cannot be encoded, and genuine redact() output never holds one (Cs
+    # is stripped). The UnicodeEncodeError's .object is the whole forged text, so it is
+    # never allowed to propagate or to become the __context__ of the refusal.
+    encodable = True
+    try:
+        expected = redaction.text.encode("utf-8")
+    except UnicodeEncodeError:
+        encodable = False
+    if not encodable:
+        raise SensitivityViolation(
+            f"refused write to {name}: the RedactionResult text is not the output of "
+            "redact() (it holds a lone surrogate). Quarantine the run."
+        )
+
+    if payload.value != expected:
         raise SensitivityViolation(
             f"refused write to {name}: the REDACTED payload is not the text of the "
             "RedactionResult supplied with it. Write result.labelled(), encoded as UTF-8."
@@ -164,11 +178,13 @@ def write_guarded(
     (mode 0600 where the OS honours it), are flushed and fsynced, then os.replace()d over
     the target. A crash or a failed replace never leaves half an evidence file, and the
     temporary file is removed on any failure. An OSError is re-raised naming the file only
-    (the OS's own message carries the full path).
+    (the OS's own message carries the full path), raised OUTSIDE the except block so the
+    original is not reachable through __context__ either.
     """
     guard_write(path, payload, plane, redaction=redaction)
     name = Path(path).name
     tmp: Path | None = None
+    failure: tuple[int | None, str] | None = None
     try:
         fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{name}.", suffix=".partial")
         tmp = Path(tmp_name)
@@ -181,7 +197,8 @@ def write_guarded(
         if tmp is not None:
             with contextlib.suppress(OSError):
                 tmp.unlink()
-        if isinstance(exc, OSError):
-            reason = exc.strerror or type(exc).__name__
-            raise OSError(exc.errno, f"write of {name} failed: {reason}") from None
-        raise
+        if not isinstance(exc, OSError):
+            raise
+        failure = (exc.errno, exc.strerror or type(exc).__name__)
+    if failure is not None:
+        raise OSError(failure[0], f"write of {name} failed: {failure[1]}")
