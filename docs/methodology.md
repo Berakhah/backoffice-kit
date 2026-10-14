@@ -130,9 +130,9 @@ are equal.
   - with an IDN or non-ASCII TLD;
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep.
-- Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A quoted or commented local part starting more than 256 characters before its `@` is also not matched.
+- Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
-- A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), its letters can survive; the digits are still redacted.
+- A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
 - Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
 - Digit-valued `No` characters without an NFKD digit form: dingbat negative-circled digits (U+2776-U+277F), double-circled digits (U+24F5-U+24FE), Ethiopic (U+1369-U+137C), Kharoshthi (U+10A40-U+10A48), Brahmi (U+11052-U+11065), Rumi (U+10E60-U+10E7E), and similar.
 <!-- declared-gaps:end -->
@@ -178,9 +178,39 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
   The span's surrogate is then context-specific: the join is lost, but nothing leaks.
   Lower-case prose such as `on 12 March 2026` is not affected: a lower-case gapped code
   needs at least 8 digits after it.
+- **Domain literals in code-like text:** `arr@[1,2]` and `x@[i]` are redacted as
+  emails. A domain literal is any bracketed text after an `@`, except one of the
+  redactor's own surrogates.
 - **Glued identifiers:** identifiers glued together with no separator are redacted (no
   fragment of either survives, property-tested), but they merge into one span with one
   surrogate.
+
+### Performance (measured; Python 3.12, Windows, one core)
+
+The email scan is driven from each `@` (`str.find`). For each `@`:
+- a window of up to 256 characters before it is examined once;
+- without quotes, parentheses or backslashes, the start is found by walking back over
+  the local part;
+- otherwise only parse entry points are tried, after the window is cut at the last
+  character no quoted string or comment can enclose.
+
+It finds exactly what the email pattern finds when applied position by position. A
+differential property test checks this against that reference scan.
+
+| Input (1 MB unless stated) | `redact()` total | email scan alone |
+|---|---|---|
+| realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.1 s | 0.03 s / pass |
+| `a@` repeated | 1.8 s | |
+| `(a)@` repeated | 2.6 s | |
+| `\"@` repeated | 4.9 s | |
+| `"` + 254×`a` + `"@` repeated | 5.2 s | |
+| `"a"(b)` ×10 + `@ ` repeated | 13.4 s | |
+| `"a"@` repeated | 16.0 s | 0.77 s / 100k |
+
+Every case scales linearly (`test_hostile_input_scales_linearly`: 10× the input costs
+under 20× the time). The dense quoted cases are a constant-factor cost of exact matching:
+each start can parse a chain of 64 items through `"@"`-style quoted strings, and the
+position-by-position reference scan pays the same in C (0.42 s per 100k on `"a"@`).
 
 ### How redaction works, and what verification can and cannot catch
 

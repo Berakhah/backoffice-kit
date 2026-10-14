@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from hypothesis import given
+from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from bok_core.boundary.redact import RedactionFailed, RedactionResult, redact
@@ -250,6 +250,9 @@ _HOSTILE = {
     "gapped_lower_cc": "gb 82 ",
     "upper_gapped": "AA 00 ",
     "html": '<td class="x-1 y_2">Ab12 cd34 @ ef.gh</td> ',
+    "quoted_comment_chain": '"a"(b)' * 10 + "@ ",
+    "json_escaped": '{\\"to\\":\\"jo smith\\"@x.test\\"} ',
+    "at_runs": "@@@@4111 ",
 }
 
 
@@ -748,6 +751,149 @@ def test_quoted_pairs_nested_comments_and_domain_literals_are_redacted_whole(
     assert r.verified is True
     assert r.surrogate_count == {"email": 1}
     assert _only_surrogate_left(r, "mail ", " now"), r.text
+
+
+# --- Task 8b fix round 2 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        '"john smith@acme"@x.test',  # inner "@" after a space cut off the real address
+        "jonathan(home x@y)@x.test",
+        "jonathan(see a@b)smith@x.test",
+        '"john,smith@x"@corp.test',
+        '"robert smith@x.test"@relay.test',  # enclosing match, not the inner email
+        "(Robert x@y)robert@x.test",
+    ],
+)
+def test_an_inner_at_sign_never_cuts_off_the_enclosing_address(email: str) -> None:
+    r = redact(_cc(f"mail {email} now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"email": 1}
+    assert _only_surrogate_left(r, "mail ", " now"), r.text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'x=\\"jonathan smith\\"@x.test y',  # JSON-escaped quotes: evidence is stored as JSON
+        'C:\\"jonathan\\"@x.test y',
+        '"jonathan\\"@x.test y',
+        '{\\"to\\":\\"jo smith\\"@x.test\\"} y',
+    ],
+)
+def test_a_json_escaped_quoted_local_part_is_redacted(text: str) -> None:
+    r = redact(_cc(text), key=KEY)
+    assert r.verified is True
+    assert "email" in r.surrogate_count
+    for word in ("jonathan", "smith"):
+        assert word not in r.text, r.text
+
+
+@pytest.mark.parametrize(
+    "text", ["pay to @@@@4111 1111 1111 1111", "x@@@@ana@x.test", "@@@@@@@@ 12345678"]
+)
+def test_surrogates_are_never_taken_for_a_domain_literal(text: str) -> None:
+    """'@[CARD:...]' looked like a domain literal, so each pass made a new match and 4+
+    glued '@' exhausted the passes: verified=False on a fully redacted text."""
+    import bok_core.boundary.redact as m
+
+    assert m._DETECTORS["email"].search("@[CARD:abcdefghijkl]") is None
+    r = redact(_cc(text), key=KEY)
+    assert r.verified is True
+
+
+# Differential guard. The REFERENCE is the email pattern applied position by position
+# (finditer), with no shortcut; the fast @-driven scan must cover at least every character
+# a reference match covers. p13's corpus shape: quotes, \", parentheses, '@', spaces,
+# commas, escapes, brackets, Mc and accented letters, and real emails.
+_BS = chr(92)
+_DIFF_CHARS = [
+    *"aaaabbbcxyz019",
+    *"@@@@",
+    *'"""',
+    "(",
+    ")",
+    _BS,
+    " ",
+    " ",
+    ".",
+    "-",
+    "\n",
+    ",",
+    "[",
+    "]",
+    ":",
+    "!",
+    "'",
+    "\u093e",
+    "\u00e9",
+]
+_DIFF_TOKENS = [
+    "@",
+    '"',
+    "(",
+    ")",
+    _BS + '"',
+    "a@b",
+    '"a b@c"',
+    "(x@y)",
+    ".test",
+    "x.test",
+    "[1.2.3.4]",
+    "[IPv6:1::2]",
+    "jo",
+    "smith",
+    " ",
+    "@x.test",
+    '""',
+    "()",
+    "((a)b)",
+    "a" * 30,
+    " " * 3,
+    "ana@x.test",
+    '"jo smith"@x.test',
+    "jo(c)@x.test",
+]
+_DIFF_CORPUS = st.one_of(
+    st.lists(st.sampled_from(_DIFF_CHARS), min_size=1, max_size=40).map("".join),
+    st.lists(st.sampled_from(_DIFF_TOKENS + _DIFF_CHARS), min_size=1, max_size=14).map("".join),
+)
+
+
+def _reference_email_cover(text: str) -> set[int]:
+    import bok_core.boundary.redact as m
+
+    return {i for mt in m._DETECTORS["email"].finditer(text) for i in range(*mt.span())}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x " + "a" * 70 + '"q"@x.test',  # the 64-item cap binds inside the run
+        '"q" ' + "b" * 80 + "@x.test",
+        "(c) " + "c" * 90 + '(d)"q"@x.test',
+    ],
+)
+def test_the_64_item_cap_gives_the_same_start_as_the_reference_scan(text: str) -> None:
+    """Inside a run of local-part characters a later start parses one item fewer; when
+    the 64-item cap binds, the leftmost successful start is inside the run."""
+    import bok_core.boundary.redact as m
+
+    reference = [mt.span() for mt in m._DETECTORS["email"].finditer(text)]
+    assert list(m._find_emails(text)) == reference
+
+
+@settings(max_examples=1500, deadline=None)
+@given(raw=_DIFF_CORPUS)
+def test_the_fast_email_scan_covers_everything_the_reference_scan_covers(raw: str) -> None:
+    import bok_core.boundary.redact as m
+
+    text = m._normalise(raw)
+    fast = {i for start, end in m._find_emails(text) for i in range(start, end)}
+    missed = _reference_email_cover(text) - fast
+    assert not missed, (text, "".join(text[i] for i in sorted(missed)))
 
 
 # --- Properties -------------------------------------------------------------------------

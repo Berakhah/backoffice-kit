@@ -89,11 +89,20 @@ _MC = "".join(chr(cp) for cp in range(0x0900, 0x1D200) if unicodedata.category(c
 # ("jonathan(a(b)c)"); the round-2 forms stopped at the backslash or the inner "(" and
 # left the start of the address behind.
 _QUOTED = r'"(?:[^"\\\r\n]|\\.){1,64}"'
+# A JSON-escaped quoted string: evidence is stored as JSON, where '"jo smith"@x.test'
+# becomes '\\"jo smith\\"@x.test'. A closing backslash-quote also ends a quoted string,
+# tried only after the RFC form fails (over-redaction).
+_QUOTED_JSON = r'"(?:[^"\\\r\n]|\\[^"\r\n]){1,64}\\"'
 _COMMENT = r"\((?:[^()\r\n]|\([^()\r\n]{0,64}\)){0,64}\)"
-_LOCAL_PART = rf"(?:[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]|{_QUOTED}|{_COMMENT}){{0,64}}+"
+_LOCAL_PART = rf"(?:[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]|{_QUOTED}|{_QUOTED_JSON}|{_COMMENT}){{0,64}}+"
 # A host name, or a domain literal: "jonathan@[192.168.0.1]" left "jonathan@[" and "]"
 # around an ACCOUNT surrogate, and "@[IPv6:2001:db8::1]" matched nothing at all.
-_DOMAIN = r"(?:[\w.-]{1,255}\.[A-Za-z]{2,63}|\[[^\[\]\r\n]{1,255}\])"
+# A domain literal never matches one of the redactor's own surrogates ("@[CARD:...]"):
+# otherwise each pass made a new match and 4+ glued "@" exhausted the passes.
+_DOMAIN = (
+    r"(?:[\w.-]{1,255}\.[A-Za-z]{2,63}"
+    r"|\[(?![A-Z_]+:[a-p]{12}\])[^\[\]\r\n]{1,255}\])"
+)
 
 _DETECTORS: dict[str, re.Pattern[str]] = {
     # No \b at either end: the local part may start mid-run ("...AAAAaaaa@a.test" after
@@ -224,48 +233,146 @@ def _finder(
     return find
 
 
-# How far before an "@" a quoted or commented local part may start (RFC 5321 caps a
-# local part at 64 octets; 256 leaves room for quoting). Declared in methodology.md.
+# How far before an "@" a local part may start (RFC 5321 caps a local part at 64
+# octets; 256 leaves room for quoting). Declared in methodology.md.
 _EMAIL_LOOKBACK = 256
-# An unquoted local part: the run of local-part characters before the "@", at most 64.
+_LOCAL_RE = re.compile(_LOCAL_PART)
+_DOMAIN_RE = re.compile(_DOMAIN)
+# An unquoted local part is a run of these characters; at most 64 of them.
 _LOCAL_CHAR = re.compile(rf"[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]")
 _LOCAL_LIMIT = 64
-# A run preceded by one of these may continue a quoted string, quoted-pair or comment.
-_QUOTING = frozenset('")\\')
+# Characters that make a local-part parse depend on more than the run before the "@".
+_QUOTING_RE = re.compile(r'["()\\]')
+
+
+def _parse(text: str, start: int) -> tuple[int, int | None]:
+    """(end of the local-part parse, end of the email match or None) for a start.
+
+    Equivalent to _DETECTORS["email"].match(text, start): the local part is possessive,
+    so the match exists iff its parse ends on an "@" followed by a domain."""
+    local = _LOCAL_RE.match(text, start)
+    local_end = local.end() if local is not None else start
+    if local_end < len(text) and text[local_end] == "@":
+        domain = _DOMAIN_RE.match(text, local_end + 1)
+        if domain is not None:
+            return local_end, domain.end()
+    return local_end, None
+
+
+# Parse entry points that can succeed: a quote or "(" (opens a quoted string or comment),
+# or the first character of a run of local-part characters that is followed by a quote,
+# "(" or "@" -- a run followed by anything else stops the parse there, short of any "@".
+# Enumerated in C over a window (zero-width: the run is only looked at).
+_LOCAL_CLASS = rf"[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]"
+_ENTRY_RE = re.compile(rf"[\"(]|(?<!{_LOCAL_CLASS})(?=(?>{_LOCAL_CLASS}+)[\"(@])")
+
+
+# A character no unquoted local part contains (and not "@", which a window holds only at
+# its end). _LAST_BREAKER_RE finds the last one before endpos: only non-breakers follow.
+_NON_BREAKER = rf"[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}\"()\\\\@]"
+_LAST_BREAKER_RE = re.compile(rf"(?!{_NON_BREAKER})[\s\S](?={_NON_BREAKER}*$)")
+_LINE_BREAK_RE = re.compile(r"[\r\n]")
+_QUOTED_MAX = 65  # a quoted string enclosing a breaker opens at most this far before it
+
+
+def _could_enclose(text: str, lo: int, breaker: int) -> bool:
+    """Could a start in [lo, breaker) parse through `breaker`, i.e. enclose it in a
+    quoted string or a comment? A necessary condition: True means "try every entry"."""
+    line_start = max(lo, text.rfind("\n", lo, breaker) + 1, text.rfind("\r", lo, breaker) + 1)
+    if "(" in text[line_start:breaker]:
+        return True  # a comment could enclose it
+    quote = text.rfind('"', lo, breaker)
+    if quote == -1 or breaker - quote > _QUOTED_MAX:
+        return False
+    if _LINE_BREAK_RE.search(text, quote, breaker) is not None:
+        return False
+    if quote > lo and text[quote - 1] == "\\":
+        return True  # an escaped quote: an earlier string may still be open
+    return _parse(text, quote)[1] is not None
+
+
+def _first_email_in(text: str, lo: int, at: int) -> tuple[int, int] | None:
+    """The leftmost match starting in [lo, at], exactly as a position-by-position scan
+    would find it (its "@" may be this one or a later one, when this one is inside a
+    quoted string or comment).
+
+    Only parse entry points are tried -- `lo`, quotes and "(", starts of local-part
+    character runs, and the "@" itself. Any other position either parses to nothing (so
+    it can only match at the "@") or lies inside a run and parses exactly like the run's
+    start with one item fewer; that differs only when the 64-item cap binds, and then
+    every position in the run is tried.
+
+    First the window is cut after its last BREAKER (a character no unquoted local part
+    contains) unless something could enclose it: a start before the breaker parses
+    through it only inside a quoted string or comment. A quoted string enclosing it can
+    only open at the last quote before it (an unescaped quote closes any earlier string),
+    holds no line break and at most 64 characters, and every start reaching that quote
+    shares its outcome -- so if the parse from that quote fails, no start before the
+    breaker can succeed. HTML attributes put quotes in almost every window; this keeps
+    each of them from costing a parse."""
+    breaker = _LAST_BREAKER_RE.search(text, lo, at)
+    if breaker is not None and not _could_enclose(text, lo, breaker.start()):
+        lo = breaker.start() + 1
+    entries = [m.start() for m in _ENTRY_RE.finditer(text, lo, at + 1)]
+    if not entries or entries[0] != lo:
+        entries.insert(0, lo)
+    entries.append(at)
+    tried: set[int] = set()
+    for p in entries:
+        if p in tried:
+            continue
+        tried.add(p)
+        local_end, end = _parse(text, p)
+        if end is not None:
+            return p, end
+        if local_end - p >= _LOCAL_LIMIT and _parse(text, local_end)[0] > local_end:
+            q = p + 1  # the cap bound: later starts in this run reach further
+            while q < at and _LOCAL_CHAR.match(text, q - 1):
+                if q not in tried:
+                    tried.add(q)
+                    end = _parse(text, q)[1]
+                    if end is not None:
+                        return q, end
+                q += 1
+    return None
 
 
 def _find_emails(text: str) -> Iterator[tuple[int, int]]:
-    """Email matches, driven from each "@" (str.find) instead of from every position.
+    """Exactly the matches of _DETECTORS["email"].finditer(text) -- within the declared
+    256-character window before each "@" -- found from each "@" (str.find) instead of
+    by trying every position.
 
-    Text without "@" costs one C-level find. For each "@" the start of the local part is
-    found by walking back over local-part characters (at most 64) and the pattern is
-    matched once there. Only when that run is preceded by a quote, ")" or backslash --
-    a quoted string or comment -- are the starts in [max(done, at - 256), at] tried
-    left to right. Each "@" costs O(local part), not O(window x local part): on a 1.1 MB
-    DOM snapshot the scan went from 0.9 s/pass (position-by-position) to milliseconds.
+    For each "@", the window [max(done, at - 256), at] is examined once and never again:
+    `done` advances only on a match (advancing it on a miss let an inner "@" cut off the
+    real address: '"john smith@acme"@x.test'). If the window holds no quote, parenthesis
+    or backslash, the only possible start is the run of local-part characters before
+    the "@" (at most 64), matched once; otherwise _first_email_in tries the parse entry
+    points left to right, which also prefers an enclosing address over an inner one.
+    tests/boundary/test_redact.py checks this against the position-by-position scan.
     """
-    pattern = _DETECTORS["email"]
     done = 0
     at = text.find("@")
     while at != -1:
-        start = at
-        floor = max(done, at - _LOCAL_LIMIT)
-        while start > floor and _LOCAL_CHAR.match(text, start - 1):
-            start -= 1
-        m = None
-        if start > done and text[start - 1] in _QUOTING:
-            for candidate in range(max(done, at - _EMAIL_LOOKBACK), at + 1):
-                m = pattern.match(text, candidate)
-                if m is not None:
-                    break
-        if m is None:
-            m = pattern.match(text, start)
-        if m is not None:
-            yield m.start(), m.end()
-            done = m.end()
+        lo = max(done, at - _EMAIL_LOOKBACK)
+        found: tuple[int, int] | None = None
+        if _QUOTING_RE.search(text, lo, at) is None:
+            start = at
+            floor = max(done, at - _LOCAL_LIMIT)
+            while start > floor and _LOCAL_CHAR.match(text, start - 1):
+                start -= 1
+            end = _parse(text, start)[1]
+            if end is not None:
+                found = (start, end)
         else:
+            found = _first_email_in(text, lo, at)
+        if found is not None:
+            yield found
+            done = found[1]
+            at = text.find("@", done)
+        else:
+            # Every start in [lo, at] failed for every "@"; the next window starts after.
             done = at + 1
-        at = text.find("@", max(done, at + 1))
+            at = text.find("@", done)
 
 
 # Every scan run over the text, under its kind. The supplementary IBAN shapes are scanned

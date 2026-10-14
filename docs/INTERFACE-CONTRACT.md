@@ -216,9 +216,9 @@ As of 0.2.6 (Task 8b hardening):
   - with an IDN or non-ASCII TLD;
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep.
-- Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A quoted or commented local part starting more than 256 characters before its `@` is also not matched.
+- Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
-- A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), its letters can survive; the digits are still redacted.
+- A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
 - Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
 - Digit-valued `No` characters without an NFKD digit form: dingbat negative-circled digits (U+2776-U+277F), double-circled digits (U+24F5-U+24FE), Ethiopic (U+1369-U+137C), Kharoshthi (U+10A40-U+10A48), Brahmi (U+11052-U+11065), Rumi (U+10E60-U+10E7E), and similar.
 <!-- declared-gaps:end -->
@@ -233,6 +233,16 @@ As of 0.2.7 (Task 8b fix round 1):
 - U+2550 is mapped to `-`.
 - The declared-gaps list above is updated (local-part lengths stated precisely;
   parenthesised letters U+249C-U+24B5).
+
+As of 0.2.8 (Task 8b fix round 2):
+- The @-driven email scan finds exactly what the email pattern finds position by
+  position, within the declared 256-character window. A differential property test
+  pins this.
+- A miss no longer advances the scan, so an inner `@` never cuts off the enclosing
+  address, and the enclosing (leftmost) match wins.
+- JSON-escaped quoted local parts (`\"jo smith\"@x.test`) are redacted.
+- A domain literal never matches a surrogate.
+- Measured performance figures are in `docs/methodology.md`.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -887,6 +897,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.8 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 2. No symbol changes.** (1) The @-driven email scan is now exact against the position-by-position pattern scan (within the 256-character window), with a differential property test. A miss no longer advances the scan: an inner `@` preceded by a non-local-part character had cut off the real address (`"john smith@acme"@x.test`). (2) JSON-escaped quoted local parts are redacted. (3) The enclosing match wins over an inner email. (4) Domain literals exclude surrogates, so 4+ glued `@` no longer exhaust the passes. (5) Declared: domain-literal over-redaction of code-like text, and measured performance (realistic 1.1 MB DOM 1.1 s; dense adversarial quoted input up to 16 s/MB, linear). The glued-letter country-code wording was corrected. |
 | 0.2.7 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 1. No symbol changes; three covered-class leaks closed.** (1) Lower/mixed-case gapped IBAN country codes are accepted when standing alone with a digit-heavy BBAN (≥ 8 digits); prose such as `on 12 March 2026` is untouched. (2) Quoted-pair local parts, one level of comment nesting, and domain literals are redacted whole. (3) The email scan is driven from each `@` with a bounded backward window (a 1.1 MB DOM snapshot went from 0.9 s to ~2 ms per pass). U+2550 is mapped. The declared-gaps list is reworded and extended (local parts over 64 characters, parenthesised letters, letter-glued lower-case country codes, invalid local-part characters). |
 | 0.2.6 | 2026-10-14 | **§1.3 `redact` — Task 8b hardening. No symbol changes; detection widened.** (1) A supplementary `iban` pattern for national display formats (groups of any width, an optional gap after an upper-case country code, 11–30 BBAN letters/digits). (2) Email local parts take full RFC 5322 atext, quoted strings, comments and `Mc` letters (possessive and gated to 256 characters before the `@`, so they stay linear). (3) Lookalike slashes, full stops and dash-likes map into the gap set. (4) `Cs`, `Co` and `Cn` are stripped, so the output is always encodable. (5) The canonical declared-gaps list now lives in §1.3 and `docs/methodology.md` between `declared-gaps` markers, kept identical by a test. It adds digit-valued `No` characters without an NFKD digit form. U+00B7 and U+2022 move from not-covered to mapped. |
 | 0.2.5 | 2026-10-14 | **§1.3 `redact`. No symbol changes; normalisation made structural.** (1) NFKD, then every `Nd` → ASCII, then ALL combining marks removed (every diacritic, in all text), ALL `Cc` except TAB/LF/CR/VT/FF removed, then NFC. Per-character rules had let C0/C1 controls, marks after non-ASCII digits or whitespace, and marks inside emails split identifiers with verified=True. (2) IBAN groups take the 0–3 character gap class (dash, dot, slash, tab, double space), the trailing group included. (3) A merged span's HMAC input is its full normalised text, not a canonical form; this corrects a false sentence in 0.2.4. IBAN canonical = alphanumerics only. Declared trade-off: the overlapping IBAN scan can absorb a following 1–4 character word into a merged span, which loses that join. (4) Declared NOT covered: `,` `'` `:` `|` `_` `;` `·` `•` U+066B U+066C separators, gaps of 4+ characters, and IDN/non-ASCII-TLD emails. |
