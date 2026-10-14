@@ -33,7 +33,9 @@ And the result object no longer carries the identifiers it removed: see Redactio
 
 from __future__ import annotations
 
+import bisect
 import hmac
+import json
 import re
 import unicodedata
 from collections.abc import Callable, Iterator
@@ -762,6 +764,37 @@ def _detected_kinds(text: str) -> list[str]:
     return sorted({kind for kind, find in _SCANS if next(find(text), None) is not None})
 
 
+# JSON NUMBERS. An identifier can be a bare JSON number ({"ts": 1697000000000} -- an
+# epoch-ms timestamp is in nearly every JSON DOM or network capture), and its unquoted
+# surrogate made the document unparseable. When the normalised input is a valid JSON
+# document, a span lying inside a number token OUTSIDE every string is widened to the
+# whole token (sign, fraction, exponent) and its surrogate written as a quoted string.
+# Strings are matched first, so a number inside a string (twice-encoded JSON) is never
+# quoted, and text that is not JSON never gains a quote.
+_JSON_TOKEN = re.compile(r'"(?:[^"\\]++|\\.)*+"|-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+
+
+def _is_json(text: str) -> bool:
+    try:
+        json.loads(text)
+    except (ValueError, RecursionError):
+        return False
+    return True
+
+
+def _json_number_tokens(text: str) -> list[tuple[int, int]]:
+    """(start, end) of every number token outside a string, in order."""
+    return [m.span() for m in _JSON_TOKEN.finditer(text) if not m.group().startswith('"')]
+
+
+def _enclosing_token(tokens: list[tuple[int, int]], start: int, end: int) -> tuple[int, int] | None:
+    """The number token containing [start, end), if any (tokens are sorted, disjoint)."""
+    i = bisect.bisect_right(tokens, start, key=lambda token: token[0]) - 1
+    if i >= 0 and tokens[i][0] <= start and end <= tokens[i][1]:
+        return tokens[i]
+    return None
+
+
 def _hmac_input(kind: str, original: str, *, standalone: bool = True) -> str:
     """A standalone identifier is keyed on its CANONICAL form, so it shares a surrogate
     across layouts and case. A MERGED span is keyed on its full normalised text: a
@@ -790,17 +823,25 @@ def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult:
 
     text = _normalise(payload.value)
     seen: dict[str, set[str]] = {}
+    is_json = _is_json(text)
 
     for _ in range(_MAX_PASSES):
         spans = _merged_spans(text)
         if not spans:
             break
+        numbers = _json_number_tokens(text) if is_json else []
         parts: list[str] = []
         cursor = 0
         for start, end, kind, standalone in spans:
             original = text[start:end]
             seen.setdefault(kind, set()).add(_hmac_input(kind, original, standalone=standalone))
             surrogate = _surrogate(kind, original, key, standalone=standalone)
+            token = _enclosing_token(numbers, start, end)
+            if token is not None:  # a bare JSON number: replace the token, quoted
+                start, end = token
+                surrogate = f'"{surrogate}"'
+                if start < cursor:  # a second span in a token already replaced
+                    continue
             parts += [text[cursor:start], surrogate]
             cursor = end
         text = "".join([*parts, text[cursor:]])

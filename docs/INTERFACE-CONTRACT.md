@@ -219,7 +219,7 @@ As of 0.2.6 (Task 8b hardening):
   - whose local part contains a quoted string whose content STARTS, after optional whitespace and `[` `]` `{` `}` (and backslashes, in JSON-escaped text), with `:` or `,` (`",jo"@x.test` keeps `,jo"`; `jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is the shape of a JSON separator and is never read as a quoted local part. In a valid JSON document the text between two strings always has this shape, whatever value lies between them (`": "`, `", "`, `": 1, "`, `": [true, "`, `": 7}, "`), so a key, a previous value or JSON punctuation is never joined to an address by a quoted-string reading. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) and ones with `,` or `:` later (`"a,b"`) are still quoted local parts.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only, and only while no JSON NUMBER literal is itself an identifier: an inner payload of twice-encoded JSON may stop parsing, and a number of 8 or more digits (`{"n": 123456789}`, `0.1234567890123`) is replaced by an UNQUOTED surrogate, so the document no longer parses. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only: an inner payload of twice-encoded JSON may stop parsing. A JSON NUMBER that is an identifier (8+ digits: `{"ts": 1697000000000}`) becomes a quoted surrogate STRING (`{"ts": "[CARD:...]"}`), so its value changes type from number to string. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
   - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
@@ -318,11 +318,22 @@ As of 0.2.12 (Task 8b breaker ruling, carried into Task 10):
 - Declared gap: a real quoted local part starting with `,` or `:` (`",jo"@x.test` keeps
   `,jo"`).
 - Redacting a valid JSON document yields a valid JSON document with the same structure
-  and the same non-string values at the OUTER layer, **provided no JSON number literal is
-  itself an identifier**: a number of 8+ digits (`{"n": 123456789}`) is replaced by an
-  unquoted surrogate and the document stops parsing (declared; redact values before
-  serialising, as above). Property-tested over random trees of strings, numbers below 8
-  digits, booleans, null, and nested arrays and objects.
+  and the same non-string values at the OUTER layer, except that a JSON number that is
+  an identifier becomes a quoted surrogate string *(0.2.14; under 0.2.12 it became an
+  UNQUOTED surrogate and the document stopped parsing)*. Property-tested over random
+  trees of strings, numbers (8-20 digit integers and arbitrary floats included),
+  booleans, null, and nested arrays and objects.
+
+As of 0.2.14 (Task 10 fix round 1):
+- **JSON numbers.** When the normalised input is a valid JSON document, a redacted span
+  inside a number token outside every string is widened to the whole token and its
+  surrogate written quoted: `{"ts": 1697000000000}` -> `{"ts": "[CARD:...]"}`. A
+  number inside a string (twice-encoded JSON) and text that is not JSON are untouched.
+- **`egress` depends on two internals of this module**: `_normalise` (genuine output is
+  a fixpoint of it -- property-tested) and `_detected_kinds` (the verification pass).
+  `guard_write` refuses a `RedactionResult` whose text is not normalised and re-runs
+  `_detected_kinds` on it. A refactor of `redact` must keep both, with these semantics,
+  or update `egress` and `tests/boundary/test_egress.py` with it.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -395,17 +406,39 @@ As of 0.2.13 (Task 10, as built — `src/bok_core/boundary/egress.py`; signature
   onto DEMO); a REDACTED payload whose bytes are not `result.text.encode("utf-8")` (a
   verified result for one document vouches for nothing else); and **re-verification** —
   every detector is re-run over the text, because `RedactionResult` is a plain model and
-  `verified=True` can be hand-built. The supported route is
+  `verified=True` can be hand-built. *(0.2.14: re-verification first refuses text that is
+  not in normalised form -- genuine `redact()` output always is -- because detection runs
+  on normalised text, and a hand-built text whose card was split by zero-width spaces or
+  backspaces passed a raw re-scan and was written.)* The supported route is
   `Labelled(result.labelled().value.encode("utf-8"), Sensitivity.REDACTED)` with
   `redaction=result`. Re-verification costs one detection pass over the text (measured: 0.34 s for a 1.1 MB redacted table-row DOM, vs 1.85 s for `redact()` itself).
-- **Errors** name the rule, the label, the plane, the path and detector kinds — never
-  payload content. Nothing in `egress` logs.
+- **Errors** name the rule, the label, the plane, the FILE NAME (`path.name`, never its
+  directories, which carry client, target and claim identifiers -- 0.2.14) and detector
+  kinds (only covered kind names; anything else in a hand-built `failures` list is
+  shown as `<unknown kind>`) — never payload content. An `OSError` from the write is
+  re-raised with the same errno and the file name only. Nothing in `egress` logs.
 - **`write_guarded` is atomic**: a uniquely named temporary file in the target's directory
   (`mkstemp`, mode 0600 where honoured), flushed and fsynced, then `os.replace`d over the
   target; the temporary file is removed on any failure, so neither a half-written target nor
   a stray partial file is left. (The plan's fixed `<name>.partial` name clobbered any file
   of that name and raced between concurrent writers.)
-- Not in scope: symlinked targets and the template's `test_no_unguarded_writes` AST scan.
+- **The plane is asserted by the caller; it is not derived from `path`.**
+  `write_guarded(demo_dir / "shot.png", <CLIENT_CONFIDENTIAL>, Plane.CLIENT)` succeeds:
+  egress cannot know which directory is public. Each consumer MUST map `Plane` to its
+  storage root in ONE place (e.g. `root_for(plane) / relative`) and never pass a plane
+  chosen independently of the path. Path canonicalisation and symlink handling only
+  become meaningful once a consumer does that mapping, and are the consumer's to enforce
+  at its storage root.
+- **What egress enforces is "a claimed redaction is proven", not "evidence is
+  redacted".** The CLIENT plane accepts unredacted CLIENT_CONFIDENTIAL by design (it is
+  compose-only with no third-party processor). A consumer that must store only redacted
+  evidence (selector-drift: "every screenshot and DOM snapshot is redacted before
+  storage") enforces that by labelling: it passes REDACTED + the `RedactionResult`, and
+  its own tests assert that its evidence writes never use CLIENT_CONFIDENTIAL.
+- **`RedactionResult` is text-only.** There is no redaction proof for images: a
+  screenshot can be written only as CLIENT_CONFIDENTIAL to the CLIENT plane, never as
+  REDACTED and never to DEMO.
+- Not in this task: the template's `test_no_unguarded_writes` AST scan.
 
 ---
 
@@ -1002,6 +1035,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.14 | 2026-10-15 | **§1.3 `redact` + §1.5 `egress` — Task 10 fix round 1. No signature changes.** (1) egress re-verification refuses a `RedactionResult` whose text is not in normalised form and detects on normalised text: a hand-built `verified=True` over a ZWSP- or backspace-split card was written as REDACTED (genuine output is a normalisation fixpoint, property-tested). (2) A JSON number that is an identifier becomes a quoted surrogate string when the input is a valid JSON document (`{"ts": 1697000000000}` had stopped parsing); the declared gap is removed from both canonical lists and added to over-redaction. (3) egress errors name `path.name` only; OSErrors from the write are re-raised with the file name only; hand-built `failures` echo covered kinds only. (4) Declared in §1.5: the plane is caller-asserted, not derived from the path; egress proves claimed redactions, it does not require them; no image redaction proof exists. (5) §1.3 records egress's dependency on `_normalise` and `_detected_kinds`. |
 | 0.2.13 | 2026-10-14 | **§1.5 `egress` — Task 10, as built. No signature changes.** `Plane`, `guard_write`, `write_guarded` implemented. Beyond the four contracted refusals: (1) fail closed on an unknown plane or sensitivity label (`SensitivityViolation`) and on a non-bytes payload or non-`RedactionResult` redaction (`TypeError`); (2) a `RedactionResult` attached to a non-REDACTED payload is refused; (3) a REDACTED payload must be exactly `result.text` as UTF-8; (4) the guard re-runs every detector over that text (`redact._detected_kinds`, now shared with `redact()`'s own verification), so a hand-built `verified=True` is not trusted. `write_guarded` writes via a unique `mkstemp` file + fsync + `os.replace`, removing the temporary on failure. Errors carry rule, label, plane, path and kinds only; egress never logs. |
 | 0.2.12 | 2026-10-14 | **§1.3 `redact` — Task 8b breaker ruling (carried into Task 10). No symbol changes.** (1) A quoted string whose content starts, after optional whitespace and brackets (and backslashes in the escaped forms), with `:` or `,` is never a quoted local part; 0.2.11 excluded only punctuation-only strings, so separators holding a number, boolean, null, array or object (`": 1, "`, `": 7}, "`) swallowed neighbouring keys/values and `{"a": [1, "ana@x.test"]}` redacted to invalid JSON with verified=True (`["jonathan", {"a": 1}, "smith@x.test"]` was a regression vs 0.2.10). (2) Declared gap: quoted local parts starting with `,` or `:` (`",jo"@x.test`). (3) Corrected false claims of 0.2.11: "never joins a key or a previous value to an address" (now true for every JSON separator) and "valid JSON at the outer layer" (now qualified: not when a JSON number literal of 8+ digits is itself an identifier — it becomes an unquoted surrogate). (4) Properties: random JSON trees with numbers, booleans, null and nested arrays/objects as neighbouring values keep their structure and non-string values; the lookaheads are pinned directly. |
 | 0.2.11 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 5. No symbol changes.** (1) Normalisation decodes the one-layer JSON escapes `\b` (removed) and `\/` (→ `/`) as a decoder would, only after an even backslash run (`\\b`, `\\/` untouched); a backspace-split card, IBAN or account and `\b`/`\/` inside emails had kept identifiers with verified=True. `\b`/`\/` leave the gap-escape set. (2) A quoted string that is a JSON separator (whitespace and brackets around `:` or `,`) is not a quoted local part: `{"k": "ana@x.test"}` had become `{"[EMAIL:…]"}`. (3) The "redacted JSON stays valid JSON" claim is qualified to the outer layer. (4) Declared over-redaction: JSON-newline-separated short numbers join into one account. (5) Performance rows refreshed (`"a"(b)`) and added (`GB12`, `GB12\t`). |

@@ -135,7 +135,7 @@ are equal.
   - whose local part contains a quoted string whose content STARTS, after optional whitespace and `[` `]` `{` `}` (and backslashes, in JSON-escaped text), with `:` or `,` (`",jo"@x.test` keeps `,jo"`; `jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is the shape of a JSON separator and is never read as a quoted local part. In a valid JSON document the text between two strings always has this shape, whatever value lies between them (`": "`, `", "`, `": 1, "`, `": [true, "`, `": 7}, "`), so a key, a previous value or JSON punctuation is never joined to an address by a quoted-string reading. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) and ones with `,` or `:` later (`"a,b"`) are still quoted local parts.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only, and only while no JSON NUMBER literal is itself an identifier: an inner payload of twice-encoded JSON may stop parsing, and a number of 8 or more digits (`{"n": 123456789}`, `0.1234567890123`) is replaced by an UNQUOTED surrogate, so the document no longer parses. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only: an inner payload of twice-encoded JSON may stop parsing. A JSON NUMBER that is an identifier (8+ digits: `{"ts": 1697000000000}`) becomes a quoted surrogate STRING (`{"ts": "[CARD:...]"}`), so its value changes type from number to string. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
   - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
@@ -152,6 +152,10 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
 
 - **Any 8+ digits joined by the gap set:** dates (`2026-10-14`, `2026/10/14`,
   `20261014`), IP addresses (`192.168.100.200`), version strings, order numbers.
+- **JSON numbers of 8+ digits** (epoch-ms timestamps, ids, amounts in minor units)
+  become quoted surrogate strings when the input is a valid JSON document: the whole
+  number token (sign, fraction, exponent) is replaced and the value's type changes
+  from number to string.
 - **Rows of small numbers and prices** in tab-separated or spaced tables become
   `account`, `card` or `digit_run`: `1<TAB>2<TAB>3 ...` once it reaches 8+ digits in
   total, or `12.50 13.75 9.99`.
@@ -260,9 +264,17 @@ The price is declared: a real quoted local part starting with `,` or `:`
 (`",jo"@x.test`) keeps that quoted string. A further property builds random JSON trees
 of strings holding identifiers, numbers, booleans, null, and nested arrays and objects,
 and checks that the redacted document verifies, parses, and keeps every non-string value
-and the nesting exactly. Numbers in that property stay below 8 digits: a JSON number of
-8+ digits IS read as an account/routing/card and replaced by an unquoted surrogate, so
-that document stops parsing (declared under "Encoded text").
+and the nesting exactly; a number of 8+ digits may only become a quoted surrogate.
+
+**A JSON number that is an identifier becomes a quoted string.** `{"ts": 1697000000000}`
+(an epoch-ms timestamp, present in nearly every JSON DOM or network capture) became
+`{"ts": [CARD:...]}`, which does not parse. When the normalised input is a valid JSON
+document (`json.loads` succeeds), every number token OUTSIDE a string is located (strings
+are matched first, so a number inside a twice-encoded payload is never touched), and a
+redacted span lying inside one is widened to the whole token and written as
+`"[KIND:...]"`. Its surrogate is the one the same digits get in plain text. Text that is
+not a valid JSON document never gains a quote. The structure property includes 8-20
+digit integers and arbitrary floats, compact and default separators.
 A property puts every identifier kind, with TAB/LF/CR separators, into
 `json.dumps({"k": t})` / `json.dumps([t, "x"])` and checks that no 4-character
 fragment survives in the decoded redacted value. Over-redaction grows accordingly: lines

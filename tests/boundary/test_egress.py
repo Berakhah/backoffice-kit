@@ -149,6 +149,111 @@ def test_a_forged_verified_flag_is_re_verified(tmp_path: Path) -> None:
     _assert_silent(info.value)
 
 
+@pytest.mark.parametrize(
+    "forged_text",
+    [
+        "card 4111\u200b1111\u200b1111\u200b1111",  # zero-width space between groups
+        "card 4111" + chr(8) + "1111" + chr(8) + "1111" + chr(8) + "1111",  # backspace
+        "acct \uff19\uff18\uff17\uff16\uff15\uff14\uff13\uff12",  # full-width digits
+        "acct \u0669\u0668\u0667\u0666\u0665\u0664\u0663\u0662",  # Arabic-Indic digits
+        "ana.se\u00adcret@client.test",  # soft hyphen in an email
+        "4111\u00a01111\u00a01111\u00a01111",  # NBSP between groups
+    ],
+)
+def test_a_forged_result_hiding_identifiers_from_raw_detection_is_refused(
+    tmp_path: Path, forged_text: str
+) -> None:
+    """Fix round 1: re-verification ran the detectors over RAW text, but redact() detects
+    on NORMALISED text, so a hand-built verified=True over a ZWSP- or backspace-split
+    card was written as REDACTED. Genuine redact() output is already normalised; text that
+    is not is refused, and detection runs on the normalised form."""
+    forged = _forged(forged_text, verified=True, failures=[])
+    payload = Labelled(forged_text.encode("utf-8"), Sensitivity.REDACTED)
+    target = tmp_path / "dom.html"
+    with pytest.raises(SensitivityViolation, match="not the output of redact") as info:
+        write_guarded(target, payload, Plane.CLIENT, redaction=forged)
+    assert not target.exists()
+    assert "4111" not in str(info.value)
+
+
+def test_normalised_forged_text_is_still_re_verified(tmp_path: Path) -> None:
+    """Already-normalised text with an identifier passes the normal-form check and is
+    caught by detection on that normalised text."""
+    forged = _forged("card 4111 1111 1111 1111", verified=True, failures=[])
+    payload = Labelled(forged.text.encode("utf-8"), Sensitivity.REDACTED)
+    with pytest.raises(SensitivityViolation, match=r"re-verification failed on .*'card'"):
+        guard_write(tmp_path / "dom.html", payload, Plane.CLIENT, redaction=forged)
+
+
+def test_forged_failures_are_never_echoed(tmp_path: Path) -> None:
+    """`failures` of a hand-built result can hold anything, content included: only
+    covered kind names are echoed."""
+    forged = _forged("x", verified=False, failures=["account", "ana.secret@client.test"])
+    with pytest.raises(SensitivityViolation) as info:
+        guard_write(
+            tmp_path / "x", Labelled(b"x", Sensitivity.REDACTED), Plane.CLIENT, redaction=forged
+        )
+    assert "account" in str(info.value) and "<unknown kind>" in str(info.value)
+    _assert_silent(info.value)
+    with pytest.raises(SensitivityViolation) as plane_info:
+        guard_write(tmp_path / "x", Labelled(b"x", Sensitivity.PUBLIC), "D" * 200)  # type: ignore[arg-type]
+    assert len(str(plane_info.value)) < 80
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        CONTENT,
+        "C:\\bin x and a\\\\b 4111 1111 1111 1111",  # escaped-backslash and \b decoding
+        '{"k": "jo\\"smith@x.test", "ts": 1697000000000}',
+        "caf\u00e9 \u200b ana@x.test \uff19\uff18\uff17\uff16\uff15\uff14\uff13\uff12",
+        "plain text",
+    ],
+)
+def test_genuine_redact_output_is_accepted(tmp_path: Path, text: str) -> None:
+    payload, ok = _redacted(text)
+    target = tmp_path / "dom.html"
+    write_guarded(target, payload, Plane.CLIENT, redaction=ok)
+    assert target.read_bytes() == payload.value
+
+
+def test_errors_name_the_file_but_never_its_directories(tmp_path: Path) -> None:
+    """Fix round 1: paths carry client, target and claim identifiers. Errors echo the
+    file name only."""
+    path = tmp_path / "acme-insurance" / "claim-AB12345678" / "dom.html"
+    failed = _forged("x", verified=False, failures=["account"])
+    attempts: list[tuple[Labelled[bytes], Plane, RedactionResult | None]] = [
+        (Labelled(b"x", Sensitivity.CLIENT_CONFIDENTIAL), Plane.DEMO, None),
+        (Labelled(b"x", Sensitivity.REDACTED), Plane.DEMO, None),
+        (Labelled(b"x", Sensitivity.REDACTED), Plane.CLIENT, None),
+        (Labelled(b"x", Sensitivity.REDACTED), Plane.CLIENT, failed),
+        (Labelled(b"x", Sensitivity.PUBLIC), Plane.CLIENT, _redacted("x")[1]),
+        (Labelled(b"y", Sensitivity.REDACTED), Plane.CLIENT, _redacted("x")[1]),
+        (
+            Labelled(b"\xe2\x80\x8b", Sensitivity.REDACTED),
+            Plane.CLIENT,
+            _forged("\u200b", verified=True, failures=[]),
+        ),
+        (
+            Labelled(b"4111 1111 1111 1111", Sensitivity.REDACTED),
+            Plane.CLIENT,
+            _forged("4111 1111 1111 1111", verified=True, failures=[]),
+        ),
+    ]
+    for payload, plane, redaction in attempts:
+        with pytest.raises(SensitivityViolation) as info:
+            guard_write(path, payload, plane, redaction=redaction)
+        assert "dom.html" in str(info.value)
+        assert "acme" not in str(info.value) and "AB12345678" not in str(info.value)
+    for bad_payload, bad_redaction in (
+        (Labelled(Path("a"), Sensitivity.PUBLIC), None),
+        (Labelled(b"x", Sensitivity.REDACTED), object()),
+    ):
+        with pytest.raises(TypeError) as type_info:
+            guard_write(path, bad_payload, Plane.CLIENT, redaction=bad_redaction)  # type: ignore[arg-type]
+        assert "dom.html" in str(type_info.value) and "acme" not in str(type_info.value)
+
+
 def test_a_redaction_attached_to_a_non_redacted_payload_is_refused(tmp_path: Path) -> None:
     """Redacted text relabelled PUBLIC would launder client material onto DEMO."""
     payload, ok = _redacted()
@@ -287,11 +392,13 @@ def test_a_failed_write_leaves_neither_the_target_nor_a_partial_file(
     target.write_bytes(b"previous version")
 
     def boom(src: object, dst: object) -> None:
-        raise OSError("disk full")
+        raise OSError(28, "disk full", str(src), None, str(dst))
 
     monkeypatch.setattr(os, "replace", boom)
-    with pytest.raises(OSError, match="disk full"):
+    with pytest.raises(OSError, match=r"write of evidence.html failed: disk full") as info:
         write_guarded(target, Labelled(b"new version", Sensitivity.PUBLIC), Plane.DEMO)
+    assert info.value.errno == 28
+    assert str(tmp_path) not in str(info.value)  # the OS message's full paths are dropped
     assert target.read_bytes() == b"previous version"  # never half-written
     assert [p.name for p in tmp_path.iterdir()] == ["evidence.html"]
 
@@ -313,3 +420,22 @@ def test_write_guarded_does_not_clobber_a_sibling_partial_name(tmp_path: Path) -
     write_guarded(target, Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
     assert sibling.read_bytes() == b"someone else's file"
     assert target.read_bytes() == b"x"
+
+
+def test_a_missing_directory_names_the_file_only(tmp_path: Path) -> None:
+    target = tmp_path / "acme-insurance" / "claim-AB12345678" / "dom.html"
+    with pytest.raises(OSError, match=r"write of dom.html failed") as info:
+        write_guarded(target, Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
+    assert "acme" not in str(info.value) and "AB12345678" not in str(info.value)
+
+
+def test_a_non_os_failure_also_removes_the_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(fd: int) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "fsync", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        write_guarded(tmp_path / "e.html", Labelled(b"x", Sensitivity.PUBLIC), Plane.DEMO)
+    assert list(tmp_path.iterdir()) == []

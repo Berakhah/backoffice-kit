@@ -1669,13 +1669,47 @@ def _shape(value: object) -> object:
     return value
 
 
-# Numbers stay below 8 digits: a JSON number literal that IS an identifier (8+ digits) is
-# replaced by an unquoted surrogate (declared in the contract), which is not what this
-# property is about.
+def _digits(value: object) -> int:
+    return sum(ch.isdigit() for ch in json.dumps(value))
+
+
+def _same_shape(loaded: object, original: object) -> bool:
+    """Structure and non-string values survive exactly; strings stay strings; a number
+    of 8+ digits may become a (quoted surrogate) string, nothing else may change type."""
+    if isinstance(original, str):
+        return isinstance(loaded, str)
+    if isinstance(original, list):
+        return (
+            isinstance(loaded, list)
+            and len(loaded) == len(original)
+            and all(_same_shape(a, b) for a, b in zip(loaded, original, strict=True))
+        )
+    if isinstance(original, dict):
+        return (
+            isinstance(loaded, dict)
+            and list(loaded) == list(original)
+            and all(_same_shape(loaded[k], v) for k, v in original.items())
+        )
+    if isinstance(loaded, str):
+        return (
+            isinstance(original, int | float)
+            and not isinstance(original, bool)
+            and _digits(original) >= 8
+            and _SURROGATE.fullmatch(loaded) is not None
+        )
+    return bool(loaded == original)
+
+
+# Numbers of any size. Fix round 1 (Task 10): a JSON number of 8+ digits IS an identifier
+# (an epoch-ms timestamp is a 13-digit `card`/`account` shape); its surrogate is now
+# written as a quoted JSON string, so the document still parses.
 _JSON_SCALAR = st.one_of(
     _JSON_VALUE,
     st.integers(min_value=-999_999, max_value=999_999),
+    st.integers(min_value=10**7, max_value=10**20 - 1),  # 8-20 digits
+    st.integers(min_value=-(10**20) + 1, max_value=-(10**7)),
     st.floats(min_value=-9_999, max_value=9_999, allow_nan=False).map(lambda f: round(f, 2)),
+    st.floats(allow_nan=False, allow_infinity=False),  # 1.2345678901234567e+19 and such
     st.booleans(),
     st.none(),
 )
@@ -1709,7 +1743,7 @@ def test_redacted_json_with_any_neighbouring_values_keeps_its_structure(
     separators = (",", ":") if compact else None
     r = redact(_cc(json.dumps(obj, ensure_ascii=ensure_ascii, separators=separators)), key=KEY)
     assert r.verified is True, r.failures
-    assert _shape(json.loads(r.text)) == _shape(obj), r.text
+    assert _same_shape(json.loads(r.text), obj), r.text
 
 
 @settings(max_examples=300, deadline=None)
@@ -1728,7 +1762,7 @@ def test_an_email_among_non_string_values_leaves_no_local_part_word(
     others = json.dumps([before, after])
     r = redact(_cc(document), key=KEY)
     assert r.verified is True, r.failures
-    assert _shape(json.loads(r.text)) == _shape([before, email, after]), r.text
+    assert _same_shape(json.loads(r.text), [before, email, after]), r.text
     for word in words - {w for w in words if w in others}:
         assert word not in _leftover(r.text), (document, r.text)
 
@@ -1773,13 +1807,100 @@ def test_the_separator_lookaheads_test_only_the_start_of_the_content(
     assert (re.match(m._NOT_ESCAPED_PUNCTUATION, escaped) is None) is is_separator
 
 
-def test_a_json_number_that_is_an_identifier_breaks_the_document_declared() -> None:
-    """DECLARED, pinned: the valid-JSON claim holds only while no JSON number literal is
-    itself an identifier. A 9-digit number is a routing number; its surrogate is written
-    unquoted, so the document no longer parses. Callers redact values before
-    serialising."""
-    r = redact(_cc(json.dumps({"n": 123456789})), key=KEY)
+@pytest.mark.parametrize(
+    ("obj", "kept"),
+    [
+        ({"ts": 1697000000000, "e": "ana@x.test"}, []),  # epoch-ms: in every capture
+        ({"n": 123456789}, []),
+        ([12345678, 87654321], []),
+        ({"n": -123456789}, []),
+        ({"n": 0.1234567890123}, []),
+        ({"n": 1.2345678901234567e19}, []),
+        ([12345678e12345678], []),  # two spans in one number token (json gives inf)
+        ({"n": 123456789, "small": 42, "f": 1.5}, [42, 1.5]),
+    ],
+)
+@pytest.mark.parametrize("compact", [False, True])
+def test_a_json_number_that_is_an_identifier_becomes_a_quoted_surrogate(
+    obj: object, kept: list[object], compact: bool
+) -> None:
+    """Fix round 1 (Task 10): {"ts": 1697000000000} became {"ts": [CARD:...]} and no
+    longer parsed. A redacted span inside a bare JSON number (outside every string) is
+    widened to the whole number token and written as a quoted string."""
+    separators = (",", ":") if compact else None
+    document = json.dumps(obj, separators=separators)
+    if "12345678e12345678" not in document and "inf" in repr(obj):
+        document = document.replace("Infinity", "12345678e12345678")
+    r = redact(_cc(document), key=KEY)
+    assert r.verified is True, r.failures
+    loaded = json.loads(r.text)
+    for value in kept:
+        assert json.dumps(value) in r.text
+    for digits in re.findall(r"[0-9]{8,}", document):
+        assert digits not in r.text, r.text
+    assert _SURROGATE.search(r.text), r.text
+    assert loaded is not None
+
+
+def test_a_number_is_quoted_with_the_same_surrogate_as_plain_text() -> None:
+    plain = redact(_cc("= 1697000000000"), key=KEY).text.split()[1]  # "ts 16..." reads as an IBAN
+    in_json = json.loads(redact(_cc('{"ts": 1697000000000}'), key=KEY).text)["ts"]
+    assert in_json == plain
+
+
+def test_a_number_inside_a_json_string_is_not_quoted() -> None:
+    """Twice-encoded JSON: the inner number sits inside the OUTER string; quoting it
+    would put a raw quote in a string and break the outer document."""
+    document = json.dumps({"k": json.dumps({"n": 123456789})})
+    r = redact(_cc(document), key=KEY)
     assert r.verified is True
+    assert isinstance(json.loads(r.text)["k"], str), r.text
     assert "123456789" not in r.text
-    with pytest.raises(json.JSONDecodeError):
-        json.loads(r.text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["values: 12345678, next", "[12345678, 1", "{bad json: 123456789}", "x 123456789"],
+)
+def test_text_that_is_not_json_never_gains_quotes(text: str) -> None:
+    r = redact(_cc(text), key=KEY)
+    assert r.verified is True
+    assert '"' not in r.text, r.text
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    text=st.one_of(
+        st.text(max_size=80),
+        st.lists(_TAGGED.flatmap(_noisy), min_size=1, max_size=4).map(
+            lambda t: " ; ".join(v for _, v in t)
+        ),
+        _JSON_TREE.map(json.dumps),
+    )
+)
+def test_redact_output_is_a_fixpoint_of_normalisation(text: str) -> None:
+    """egress refuses a RedactionResult whose text is not already normalised (a forged
+    result can hide an identifier from raw detection). That is only sound if genuine
+    output always is."""
+    import bok_core.boundary.redact as m
+
+    for candidate in (text, json.dumps({"k": text})):
+        out = redact(_cc(candidate), key=KEY).text
+        assert m._normalise(out) == out
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "C:\\bin x",
+        "a\\\\b 4111 1111 1111 1111",
+        '{"k": "jo\\"smith@x.test"}',
+        "\\\\\\b1",
+        "\\\\\\b\\/ 4111\\b1111\\b1111\\b1111",
+    ],
+)
+def test_escaped_backslash_outputs_are_fixpoints(text: str) -> None:
+    import bok_core.boundary.redact as m
+
+    out = redact(_cc(text), key=KEY).text
+    assert m._normalise(out) == out
