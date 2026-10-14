@@ -302,6 +302,14 @@ def to_rail(claim: Claim[Any]) -> RailPayload:
     """Serialisation consumed by bok-ui's <ProvenanceRail>. Parents nest."""
 ```
 
+**Payload shape (pinned by `tests/provenance/test_render.py`; JSON keys, `extra="forbid"`).**
+
+`RailPayload`: `root: RailNode`, `depth: int` (longest root-to-leaf path in nodes; a leaf is 1), `inherited_caveats: list[str]` (own caveat first, then ancestors' verbatim, structurally de-duplicated per I4).
+
+`RailNode`: `value` (a `Decimal` is a JSON string, I5), `method` (`"DETERMINISTIC"|"MODEL"|"HUMAN"|"DERIVED"`), `derivation` (`str|null`), `source_kind` (the source's `kind` discriminator), `source` (the source model dumped as JSON, including `kind`), `confidence` (`float|null`), `calibration_state` (`"CALIBRATED"|"UNCALIBRATED"|null`), `calibration_basis` (`str|null`), `renders_as_fact` (`bool`, I2/I7), `observed_at` (ISO datetime), `caveat` (`str|null`), `parents` (`list[RailNode]`, nested, `[]` for a leaf).
+
+A shared ancestor appears under each child that has it (the payload nests; it does not reference by id).
+
 ---
 
 ## 3. `bok_core.gateway`
