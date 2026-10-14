@@ -132,7 +132,10 @@ are equal.
   - with comments nested more than one level deep.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- JSON escaping deeper than 8 backslashes in a row (a string encoded more than about three times) is not read as escaping.
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read so that a quoted local part inside a JSON string is redacted. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+  - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
+  - Other escape sequences are not decoded: `\t` `\n` `\r` `\/`, `\uXXXX` and `\xXX`. In serialised text, identifier groups separated by one are not joined (a card whose groups are separated by an escaped TAB; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
+  - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
 - A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
 - Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
@@ -189,13 +192,20 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
 
 ### Emails inside JSON evidence
 
+**The contract: decoded text plus ONE layer of JSON string escaping.** Callers MUST
+redact string values BEFORE serialising or encoding them. Redacting serialised text is a
+fallback with the declared gaps above (deeper JSON encodings, other escape sequences,
+HTML entities, percent-encoding), not the intended use.
+
 Evidence is stored as JSON, which escapes the quotes of a quoted local part:
 `"jo smith"@x.test` becomes `\"jo smith\"@x.test`. Four email scans run, and their
 spans are redacted as a union:
 1. RFC quoting first;
-2. JSON-escaped quoting first (a string ends at `\"`);
+2. JSON-escaped quoting first (a string ends at `\"`) — the one-layer guarantee;
 3. multiply-escaped quoting first (a string ends at any run of 1–8 backslashes before a
-   quote);
+   quote) — extra coverage only: twice-encoded JSON is covered for quoted local parts
+   WITHOUT an inner escaped quote, and `"jonathan\"smith"@x.test` encoded twice keeps
+   `jonathan` (pinned by a test as a declared gap);
 4. literal quoting first (`"C:\dir\"@x.test`).
 
 One grammar cannot hold them all, because inside the possessive local part the first
@@ -204,7 +214,19 @@ quoted form that matches is final.
 Without a backslash anywhere in the text the four scans are provably identical, so only
 the first runs. Each scan is exact against its own pattern applied position by position;
 a differential property test checks all four over plain, JSON-wrapped and twice-encoded
-corpora.
+corpora. That property is about each scan's exactness, not a coverage claim for
+twice-encoded text.
+
+Properties: depth 1 (`json.dumps({"k": t})`, `json.dumps([t, "x"])`) over every covered
+local-part shape is the guarantee; depth 2 is tested only for the declared shape.
+
+**Redacted JSON stays valid JSON.** Every span is widened to whole escape sequences
+(`\"`, `\n`, `\\`, `\uXXXX`). A span starting at the quote of `\"` left a dangling
+backslash (`{"dom": "\[EMAIL:...]"}`), and an account starting inside `\u00e9` left
+`\u00e[ACCOUNT:...]`; both failed `json.loads`. A property checks that `json.loads`
+succeeds on the redacted form of random JSON objects holding covered identifiers. The
+cost is up to 5 extra characters per side (over-redaction), and a JSON-escaped address's
+surrogate covers its escaping backslash, so it differs from the plain address's.
 
 ### Performance (measured; Python 3.12, Windows, one core)
 
@@ -219,12 +241,13 @@ The email scan is driven from each `@` (`str.find`). For each `@`:
 | Input (1 MB unless stated) | `redact()` total | email scan alone |
 |---|---|---|
 | realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.2 s | 0.04 s / pass |
-| JSON evidence `{\"to\":\"jo smith\"@x.test\"}` repeated | 2.9 s | |
-| `a@` repeated | 1.8 s | |
+| JSON evidence `{\"to\":\"jo smith\"@x.test\"}` repeated | 3.4 s | |
+| `a@` repeated | 2.0 s | |
 | `(a)@` repeated | 2.6 s | |
 | `"` + 254×`a` + `"@` repeated | 5.2 s | |
 | `"a"(b)` ×10 + `@ ` repeated | 13.4 s | |
-| `\"@` repeated (backslashes: all four scans run) | 14.6 s | |
+| `\@` repeated (backslashes: all four scans run) | 14.3 s | |
+| `\"@` repeated (backslashes: all four scans run) | 16.2 s | |
 | `"a"@` repeated | 16.5 s | 0.77 s / 100k |
 
 Every case scales linearly (`test_hostile_input_scales_linearly`: 10× the input costs

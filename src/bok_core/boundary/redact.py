@@ -98,7 +98,11 @@ _QUOTED = rf'"(?:[^"\\\r\n]|\\.){{1,{_QUOTED_ITEMS}}}"'
 # the 4-character '\\\"'; any other escape is 2 characters.
 _QUOTED_JSON = rf'"(?:[^"\\\r\n]|\\\\\\"|\\[^"\r\n]){{1,{_QUOTED_ITEMS}}}\\"'
 # JSON-escaped more than once (a JSON string holding JSON): any run of 1-8 backslashes
-# before a quote ends it, and a run before any other character is one escape.
+# before a quote ends it, and a run before any other character is one escape. EXTRA
+# coverage, not a guarantee: the contract covers decoded text plus ONE layer of JSON
+# escaping. Encoded twice, only quoted local parts without an inner escaped quote are
+# covered ('"jonathan\"smith"' keeps "jonathan"; declared). Callers redact values
+# before serialising them.
 _QUOTED_JSON_NESTED = (
     rf'"(?:[^"\\\r\n]|\\{{1,{_ESCAPE_RUN}}}[^"\\\r\n]){{1,{_QUOTED_ITEMS}}}'
     rf'\\{{1,{_ESCAPE_RUN}}}"'
@@ -414,7 +418,9 @@ def _email_scan(name: str, local_part: str) -> _EmailScan:
 # grammar cannot hold them all, because a possessive repetition commits to the first
 # quoted form that matches. Each scan is exact against its own pattern applied position
 # by position; readings that only exist where two addresses OVERLAP (one's domain literal
-# is the next one's local part) are not all taken -- declared in methodology.md.
+# is the next one's local part) are not all taken -- declared in methodology.md. The
+# guarantee is the "json" scan over ONE layer of JSON escaping; the nested and lenient
+# scans add coverage beyond the contract.
 _EMAIL_SCANS: tuple[_EmailScan, ...] = (
     _email_scan("rfc", _LOCAL_PART),
     _email_scan("json", _local_part(_QUOTED_JSON, _QUOTED, _QUOTED_LENIENT)),
@@ -601,6 +607,40 @@ def _canonical(kind: str, identifier: str) -> str:
     return identifier.lower()
 
 
+# An escape sequence of JSON (and most string syntaxes): a backslash that is not itself
+# escaped, then "uXXXX" or one character. A span that starts or ends INSIDE one left an
+# invalid escape behind -- the JSON-escaped quoted local part '\"jo\"@x.test' was
+# replaced from its quote on, giving '\[EMAIL:...]', and an account starting in the
+# '00e9' of '\u00e9' gave '\u00e[ACCOUNT:...]' -- so redacted JSON no longer parsed.
+# Every span is widened to whole escapes (at most 5 characters each side; over-redaction).
+_HEX4 = re.compile(r"[0-9A-Fa-f]{4}")
+_ESCAPE_REACH = 5  # the farthest an escape's backslash sits before a character inside it
+
+
+def _escape_around(text: str, i: int) -> tuple[int, int] | None:
+    """The escape sequence (start, end) that contains position `i`, or None."""
+    b = text.rfind("\\", max(0, i - _ESCAPE_REACH), i + 1)
+    if b == -1:
+        return None
+    run = 0  # backslashes before b: an odd run means text[b] is itself escaped
+    while b - run > 0 and text[b - run - 1] == "\\":
+        run += 1
+    if run % 2:
+        start, end = b - 1, b + 1
+    elif text.startswith("u", b + 1) and _HEX4.fullmatch(text, b + 2, b + 6):
+        start, end = b, b + 6
+    else:
+        start, end = b, min(b + 2, len(text))
+    return (start, end) if i < end else None
+
+
+def _whole_escapes(text: str, start: int, end: int) -> tuple[int, int]:
+    """`start`/`end` moved outward so that the span cuts no escape sequence in two."""
+    first = _escape_around(text, start)
+    last = _escape_around(text, end - 1)
+    return (first[0] if first else start), (last[1] if last else end)
+
+
 def _merged_spans(text: str) -> list[tuple[int, int, str, bool]]:
     """Every detector's matches over the same text; overlapping matches merged.
 
@@ -611,7 +651,9 @@ def _merged_spans(text: str) -> list[tuple[int, int, str, bool]]:
     """
     found: list[tuple[int, int, int, str]] = []
     for kind, find in _SCANS:
-        found.extend((start, end, _RANK[kind], kind) for start, end in find(text))
+        found.extend(
+            (*_whole_escapes(text, start, end), _RANK[kind], kind) for start, end in find(text)
+        )
     found.sort()
 
     # (start, end, label, missed, label_start, label_end)

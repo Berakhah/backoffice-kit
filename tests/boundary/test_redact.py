@@ -1,3 +1,4 @@
+import gc
 import json
 import re
 import time
@@ -261,22 +262,48 @@ def _tile(unit: str, n: int) -> str:
 
 
 def _best_time(text: str, runs: int) -> float:
+    """The fastest of `runs` timings, with the garbage collector off while timing: a
+    collection (its cost grows with the heap, not the input) landing inside one run is
+    noise, and so is a burst of CPU contention. Noise only ever INFLATES a timing, so the
+    minimum is the cleanest estimate of the real cost."""
     best = float("inf")
     for _ in range(runs):
-        started = time.perf_counter()
-        redact(_cc(text), key=KEY)
-        best = min(best, time.perf_counter() - started)
+        gc.collect()
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            redact(_cc(text), key=KEY)
+            best = min(best, time.perf_counter() - started)
+        finally:
+            gc.enable()
     return best
+
+
+_SCALING_BOUND = 20  # 10x the input; linear is ~10x, quadratic ~100x
+_SCALING_ATTEMPTS = 3
 
 
 @pytest.mark.parametrize("name", sorted(_HOSTILE))
 def test_hostile_input_scales_linearly(name: str) -> None:
     """10x the input must cost well under 20x the time. This is a ratio, not an absolute
     bound: the redactor runs on whole DOM snapshots, so a super-linear regression must
-    fail here, but a slow CI machine must not. A run under 50 ms at 100k is not judged."""
-    small = _best_time(_tile(_HOSTILE[name], 10_000), runs=3)
-    large = _best_time(_tile(_HOSTILE[name], 100_000), runs=1)
-    assert large < 0.05 or large < 20 * max(small, 0.0025), (name, small, large)
+    fail here, but a slow CI machine must not. A run under 50 ms at 100k is not judged.
+
+    Stabilised (it failed 2 of 4 full-suite runs under coverage and machine load: one
+    unlucky 100k run): a warm-up, best-of timings, and up to 3 measurement rounds, each
+    taking the minimum over ALL rounds so far for BOTH sizes. Taking minima on both sides
+    cannot hide super-linear growth -- a quadratic scan is ~100x at every round -- it only
+    discards rounds that noise inflated."""
+    small_text = _tile(_HOSTILE[name], 10_000)
+    large_text = _tile(_HOSTILE[name], 100_000)
+    redact(_cc(small_text), key=KEY)  # warm-up: regex compilation caches, allocator
+    small = large = float("inf")
+    for _ in range(_SCALING_ATTEMPTS):
+        small = min(small, _best_time(small_text, runs=3))
+        large = min(large, _best_time(large_text, runs=1))
+        if large < 0.05 or large < _SCALING_BOUND * max(small, 0.0025):
+            return
+    pytest.fail(f"super-linear: {name} 10k {small:.4f}s, 100k {large:.4f}s")
 
 
 def test_a_short_key_is_refused_without_echoing_it() -> None:
@@ -683,6 +710,11 @@ def test_declared_gaps_match_between_methodology_and_contract() -> None:
         "IDN",
         "U+249C",
         "64 characters",
+        "ONE layer of JSON string escaping",
+        "MUST redact string values BEFORE serialising",
+        "HTML entities",
+        "percent-encoding",
+        "WITHOUT an inner escaped quote",
     ):
         assert named in joined, named
 
@@ -1209,13 +1241,142 @@ _WORDS = st.from_regex(r"[a-z ]{0,16}", fullmatch=True)
 def test_an_email_embedded_in_json_evidence_leaves_no_local_part_word(
     prefix: str, email: str, suffix: str
 ) -> None:
-    """Evidence is stored as JSON. Whatever covered email sits in the text, the JSON form
-    of that text must lose every local-part word of 4+ characters."""
+    """The depth-1 GUARANTEE: evidence is stored as JSON. Whatever covered email sits in
+    the text, the JSON form of that text must lose every local-part word of 4+ characters."""
+    _local_part_words_are_gone(prefix, email, suffix, depth=1)
+
+
+# --- Task 8b fix round 4: decoded text plus ONE layer of JSON escaping -------------------
+#
+# The contract (INTERFACE-CONTRACT.md 1.3) is narrowed: redact() covers DECODED text plus
+# one layer of JSON string escaping. Deeper encodings are covered only for quoted local
+# parts without an inner escaped quote; HTML entities, \uXXXX / \xXX escapes and
+# percent-encoding are not decoded. Callers redact string values BEFORE serialising.
+
+
+def _local_part_words_are_gone(prefix: str, email: str, suffix: str, depth: int) -> None:
+    """Whatever covered email sits in the text, the JSON form of that text, encoded
+    `depth` times, must verify and lose every local-part word of 4+ characters."""
     text = f"{prefix} {email} {suffix}"
     local = email.rsplit("@", 1)[0]
     words = {w for w in re.findall(r"[A-Za-z0-9]{4,}", local) if w not in text.replace(email, "")}
     for document in (json.dumps({"k": text}), json.dumps([text, "x"])):
+        for _ in range(depth - 1):
+            document = json.dumps(document)
         r = redact(_cc(document), key=KEY)
         assert r.verified is True, r.failures
         for word in words:
             assert word not in r.text, (document, r.text)
+
+
+# Every covered local-part shape EXCEPT a quoted string with an inner escaped quote
+# ('"ab\"cd"'): the shape the contract covers when JSON is encoded twice.
+_EMAIL_LOCAL_NO_INNER_QUOTE = st.one_of(
+    st.from_regex(rf"{_ATEXT}{{1,10}}(\.{_ATEXT}{{1,6}})?", fullmatch=True),
+    st.from_regex(r'"[a-z ]{1,8}"', fullmatch=True),
+    st.from_regex(r"[a-z]{1,4}\([a-z]{1,6}\)", fullmatch=True),
+    st.from_regex(r"[a-z]{1,4}\([a-z]{1,3}\([a-z]{1,3}\)[a-z]{0,3}\)", fullmatch=True),
+)
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    prefix=_WORDS,
+    local=_EMAIL_LOCAL_NO_INNER_QUOTE,
+    domain=_EMAIL_DOMAIN,
+    suffix=_WORDS,
+)
+def test_twice_encoded_json_is_covered_for_quoted_local_parts_without_inner_quotes(
+    prefix: str, local: str, domain: str, suffix: str
+) -> None:
+    """Depth 2 is covered for the declared shape only. Depth 1 (every covered shape) is
+    test_an_email_embedded_in_json_evidence_leaves_no_local_part_word."""
+    _local_part_words_are_gone(prefix, f"{local}@{domain}", suffix, depth=2)
+
+
+def test_twice_encoded_json_with_an_inner_escaped_quote_is_a_declared_gap() -> None:
+    """DECLARED GAP, pinned. Encoded twice, the inner quoted-pair of 'jonathan\\"smith'
+    becomes a 7-backslash run whose reading no scan takes, and "jonathan" survives with
+    verified=True. Once encoded it is covered. The contract's remedy -- redact the value,
+    THEN serialise -- covers it at any depth. If this test starts failing because the
+    word is gone, the gap has closed: update the declared-gaps lists."""
+    value = 'mail "jonathan\\"smith"@x.test now'
+    once = redact(_cc(json.dumps({"k": value})), key=KEY)
+    assert once.verified is True
+    assert "jonathan" not in once.text
+
+    twice = redact(_cc(json.dumps(json.dumps({"k": value}))), key=KEY)
+    assert twice.verified is True
+    assert "jonathan" in twice.text  # the declared gap
+
+    safe = redact(_cc(value), key=KEY).labelled().value
+    assert "jonathan" not in json.dumps(json.dumps({"k": safe}))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'mail "jonathan smith"@x.test now',  # the JSON scan's span began at the quote
+        '"jonathan"@x.test',
+        "line\nana@x.test",  # the walk back stopped at the backslash of "\n"
+        "\u00e9 12345678",  # ensure_ascii writes \u00e9; the account began inside it
+        "\u0661\u0662\u0663\u0664 5678 tail",  # Arabic-Indic digits, escaped by json
+    ],
+)
+def test_redacted_json_still_parses(value: str) -> None:
+    """A span starting or ending INSIDE an escape sequence left '\\[EMAIL:...]' or
+    '\\u00e[ACCOUNT:...]', and json.loads failed with 'Invalid \\escape'. Spans are
+    widened to whole escapes."""
+    r = redact(_cc(json.dumps({"dom": value})), key=KEY)
+    assert r.verified is True
+    assert isinstance(json.loads(r.text)["dom"], str), r.text
+
+
+@pytest.mark.parametrize(
+    ("text", "span", "widened"),
+    [
+        (f"ab{_BS}u0041cd", (4, 6), (2, 8)),  # starts inside A
+        (f"ab{_BS}u0041cd", (0, 4), (0, 8)),  # ends inside A
+        (f"x{_BS}{_BS}y", (2, 4), (1, 4)),  # starts on the escaped backslash of \\
+        (f"x{_BS}{_BS}y", (0, 2), (0, 3)),  # ends on the escaping backslash of \\
+        (f"a{_BS}nb", (2, 4), (1, 4)),  # starts on the n of \n
+        (f"a{_BS}zz", (0, 2), (0, 3)),  # ends on an escaping backslash
+        (f"a{_BS}{_BS}nb", (3, 5), (3, 5)),  # \\ then a literal n: no escape is cut
+        ("plain", (1, 3), (1, 3)),
+    ],
+)
+def test_a_span_is_widened_to_whole_escape_sequences(
+    text: str, span: tuple[int, int], widened: tuple[int, int]
+) -> None:
+    """Both ends. In real JSON no detector match crosses a backslash and then ends inside
+    an escape, so the end side is pinned here rather than by the property."""
+    import bok_core.boundary.redact as m
+
+    assert m._whole_escapes(text, *span) == widened
+
+
+_JSON_TEXT = st.from_regex("[a-z\u00e9 ]{0,12}", fullmatch=True)  # e-acute: \u00e9 in JSON
+_JSON_VALUE = st.one_of(
+    _JSON_TEXT,
+    st.tuples(_JSON_TEXT, _TAGGED.flatmap(_noisy), _JSON_TEXT).map(
+        lambda t: f"{t[0]} {t[1][1]} {t[2]}"
+    ),
+)
+
+
+@settings(max_examples=500, deadline=None)
+@given(
+    obj=st.dictionaries(
+        st.from_regex(r"[a-z]{1,6}", fullmatch=True), _JSON_VALUE, min_size=1, max_size=4
+    ),
+    ensure_ascii=st.booleans(),
+)
+def test_redacted_json_evidence_stays_parseable(obj: dict[str, str], ensure_ascii: bool) -> None:
+    """Random JSON objects whose string values hold covered identifiers (with Unicode
+    separators, digits and format characters, which ensure_ascii writes as \\uXXXX):
+    the redacted document verifies and still parses, with the same keys."""
+    r = redact(_cc(json.dumps(obj, ensure_ascii=ensure_ascii)), key=KEY)
+    assert r.verified is True, r.failures
+    loaded = json.loads(r.text)
+    assert isinstance(loaded, dict)
+    assert loaded.keys() == obj.keys()
