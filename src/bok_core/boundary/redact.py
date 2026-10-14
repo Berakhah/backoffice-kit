@@ -98,15 +98,18 @@ _MC = "".join(chr(cp) for cp in range(0x0900, 0x1D200) if unicodedata.category(c
 # left the start of the address behind.
 _QUOTED_ITEMS = 64  # items in one quoted string
 _ESCAPE_RUN = 8  # longest backslash run the nested-JSON form reads as one escape
-# No quoted string of any form is a JSON SEPARATOR: whitespace and brackets around at
-# least one ":" or "," (and backslashes, for the escaped forms). Otherwise
-# '{"k": "ana@x.test"}' read 'k": "ana' as a local part -- atext "k", the quoted string
-# '": "', atext "ana" -- and the span swallowed the key and the punctuation:
-# '{"[EMAIL:...]"}', no longer JSON. A real quoted local part is never such a separator;
-# one that is ('jo", "smith@x.test') ends the local part there (declared), and the
-# address after it is still redacted. '" "' and '"[]"' stay quoted strings.
-_NOT_PUNCTUATION = r'(?![\s\[\]{}]*[:,][\s:,\[\]{}]*")'
-_NOT_ESCAPED_PUNCTUATION = r'(?![\s\[\]{}\\]*[:,][\s:,\[\]{}\\]*")'
+# No quoted string of any form is a JSON SEPARATOR: one whose content starts, after
+# optional whitespace and brackets (and backslashes, for the escaped forms), with ":" or
+# ",". Otherwise '{"k": "ana@x.test"}' read 'k": "ana' as a local part -- atext "k", the
+# quoted string '": "', atext "ana" -- and the span swallowed the key and the
+# punctuation: '{"[EMAIL:...]"}', no longer JSON. Testing only the START (not the whole
+# string) also excludes separators that hold a NON-STRING value -- '": 1, "', '", 1, "',
+# '": [1, "', '": 7}, "' -- which the round-5 punctuation-only rule still read as quoted
+# strings, swallowing '{"a": [1, "ana@x.test"]}' into one span. A real quoted local part
+# starting with "," or ":" ('",jo"@x.test') ends the local part there (declared); the
+# address after it is still redacted. '" "', '"[]"' and '"a,b"' stay quoted strings.
+_NOT_PUNCTUATION = r"(?![\s\[\]{}]*[:,])"
+_NOT_ESCAPED_PUNCTUATION = r"(?![\s\[\]{}\\]*[:,])"
 # RFC 5322: a character or a quoted-pair ("\x", 2 characters).
 _QUOTED = rf'"{_NOT_PUNCTUATION}(?:[^"\\\r\n]|\\.){{1,{_QUOTED_ITEMS}}}"'
 # JSON-escaped (evidence is stored as JSON: '"jo smith"@x.test' becomes

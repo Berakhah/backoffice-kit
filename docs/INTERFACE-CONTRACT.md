@@ -216,10 +216,10 @@ As of 0.2.6 (Task 8b hardening):
   - with an IDN or non-ASCII TLD;
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep;
-  - whose local part contains a quoted string that is a JSON separator: whitespace and `[` `]` `{` `}` around at least one `:` or `,` (`jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is not read as a quoted local part, so JSON punctuation (`": "`, `", "`) never joins a key or a previous value to an address. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) are still quoted local parts.
+  - whose local part contains a quoted string whose content STARTS, after optional whitespace and `[` `]` `{` `}` (and backslashes, in JSON-escaped text), with `:` or `,` (`",jo"@x.test` keeps `,jo"`; `jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is the shape of a JSON separator and is never read as a quoted local part. In a valid JSON document the text between two strings always has this shape, whatever value lies between them (`": "`, `", "`, `": 1, "`, `": [true, "`, `": 7}, "`), so a key, a previous value or JSON punctuation is never joined to an address by a quoted-string reading. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) and ones with `,` or `:` later (`"a,b"`) are still quoted local parts.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only: an inner payload of twice-encoded JSON may stop parsing. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only, and only while no JSON NUMBER literal is itself an identifier: an inner payload of twice-encoded JSON may stop parsing, and a number of 8 or more digits (`{"n": 123456789}`, `0.1234567890123`) is replaced by an UNQUOTED surrogate, so the document no longer parses. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
   - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
@@ -297,10 +297,32 @@ As of 0.2.11 (Task 8b fix round 5):
   least one `:` or `,`) is not a quoted local part. `{"k": "ana@x.test"}` was redacted to `{"[EMAIL:…]"}` (`k": "ana` read as
   atext + the quoted string `": "` + atext) and no longer parsed; a property now puts
   identifiers right against the JSON string quotes, with compact and default separators.
+  *(0.2.12: this rule excluded only punctuation-only strings; separators holding a
+  non-string value still swallowed neighbours. Corrected below.)*
 - Redacting a valid JSON document yields valid JSON at the outer layer; twice-encoded
-  inner payloads may stop parsing (outside the contract).
+  inner payloads may stop parsing (outside the contract). *(0.2.12: false for
+  `{"a": [1, "ana@x.test"]}` and similar under 0.2.11, and still false for a JSON number
+  of 8+ digits. Corrected below.)*
 - Over-redaction (declared): lines of short numbers in JSON text (`12\n34\n56\n78`)
   join into one `account`, as they would in decoded text.
+
+As of 0.2.12 (Task 8b breaker ruling, carried into Task 10):
+- A quoted string whose content STARTS, after optional whitespace and `[` `]` `{` `}`
+  (and backslashes, in the escaped forms), with `:` or `,` is never a quoted local part.
+  Between two strings of a valid JSON document the text always starts that way, whatever
+  lies between them — `": 1, "`, `", null, "`, `": [true, "`, `": 7}, "` — so a key, a
+  previous value or JSON punctuation is never joined to an address by a quoted-string
+  reading. Under 0.2.11, `{"a": [1, "ana@x.test"]}`, `[{"id": 7}, "ana@x.test"]` and
+  `["jonathan", {"a": 1}, "smith@x.test"]` (a regression vs 0.2.10) redacted to text
+  that did not parse, with verified=True.
+- Declared gap: a real quoted local part starting with `,` or `:` (`",jo"@x.test` keeps
+  `,jo"`).
+- Redacting a valid JSON document yields a valid JSON document with the same structure
+  and the same non-string values at the OUTER layer, **provided no JSON number literal is
+  itself an identifier**: a number of 8+ digits (`{"n": 123456789}`) is replaced by an
+  unquoted surrogate and the document stops parsing (declared; redact values before
+  serialising, as above). Property-tested over random trees of strings, numbers below 8
+  digits, booleans, null, and nested arrays and objects.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -955,6 +977,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.12 | 2026-10-14 | **§1.3 `redact` — Task 8b breaker ruling (carried into Task 10). No symbol changes.** (1) A quoted string whose content starts, after optional whitespace and brackets (and backslashes in the escaped forms), with `:` or `,` is never a quoted local part; 0.2.11 excluded only punctuation-only strings, so separators holding a number, boolean, null, array or object (`": 1, "`, `": 7}, "`) swallowed neighbouring keys/values and `{"a": [1, "ana@x.test"]}` redacted to invalid JSON with verified=True (`["jonathan", {"a": 1}, "smith@x.test"]` was a regression vs 0.2.10). (2) Declared gap: quoted local parts starting with `,` or `:` (`",jo"@x.test`). (3) Corrected false claims of 0.2.11: "never joins a key or a previous value to an address" (now true for every JSON separator) and "valid JSON at the outer layer" (now qualified: not when a JSON number literal of 8+ digits is itself an identifier — it becomes an unquoted surrogate). (4) Properties: random JSON trees with numbers, booleans, null and nested arrays/objects as neighbouring values keep their structure and non-string values; the lookaheads are pinned directly. |
 | 0.2.11 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 5. No symbol changes.** (1) Normalisation decodes the one-layer JSON escapes `\b` (removed) and `\/` (→ `/`) as a decoder would, only after an even backslash run (`\\b`, `\\/` untouched); a backspace-split card, IBAN or account and `\b`/`\/` inside emails had kept identifiers with verified=True. `\b`/`\/` leave the gap-escape set. (2) A quoted string that is a JSON separator (whitespace and brackets around `:` or `,`) is not a quoted local part: `{"k": "ana@x.test"}` had become `{"[EMAIL:…]"}`. (3) The "redacted JSON stays valid JSON" claim is qualified to the outer layer. (4) Declared over-redaction: JSON-newline-separated short numbers join into one account. (5) Performance rows refreshed (`"a"(b)`) and added (`GB12`, `GB12\t`). |
 | 0.2.10 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 4. No symbol changes; contract NARROWED.** (1) `redact()` is specified over decoded text plus one layer of JSON string escaping. Twice-encoded JSON is covered only for quoted local parts without an inner escaped quote (0.2.9 implied more); HTML entities, `\uXXXX`/`\xXX` escapes and percent-encoding are not decoded. Callers MUST redact string values before serialising or encoding them. (2) Spans are widened to whole escape sequences, so redacting a valid JSON document yields valid JSON (property-tested, `ensure_ascii` on and off). (3) The depth-1 JSON property is the guarantee; a depth-2 property covers the declared shape, and the depth-2 inner-quote case is pinned as a declared gap. (4) `test_hostile_input_scales_linearly` is stabilised (gc off while timing, warm-up, best-of over up to 3 rounds); a quadratic scan still fails it at ~85x. (5) The performance table gains the `\@` row (14.3 s/MB, linear). (6) The JSON escapes `\t` `\n` `\r` `\f` `\b` `\/` are gap characters between digit and IBAN groups (one layer of JSON escaping); a TAB-separated card in JSON text had passed unredacted with verified=True. |
 | 0.2.9 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 3. No symbol changes.** (1) JSON-escaped quoted local parts are redacted again. The JSON form had sat behind the RFC form inside a possessive repetition and was never tried on real JSON. Now four email scans (RFC-, JSON-, nested-JSON-, literal-first) are unioned; with no backslash in the text only the first runs, and the result is provably identical. (2) `_QUOTED_MAX` is derived from the patterns; 65 characters cut quoted strings of quoted-pairs (64 items reach 129). (3) The differential property covers every scan over plain, JSON-wrapped and twice-encoded corpora. (4) Declared: overlapping addresses, and escape runs over 8 backslashes. Performance re-measured: realistic 1.1 MB DOM 1.2 s, backslash-dense adversarial 14.6 s/MB, linear. |

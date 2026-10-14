@@ -132,10 +132,10 @@ are equal.
   - with an IDN or non-ASCII TLD;
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep;
-  - whose local part contains a quoted string that is a JSON separator: whitespace and `[` `]` `{` `}` around at least one `:` or `,` (`jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is not read as a quoted local part, so JSON punctuation (`": "`, `", "`) never joins a key or a previous value to an address. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) are still quoted local parts.
+  - whose local part contains a quoted string whose content STARTS, after optional whitespace and `[` `]` `{` `}` (and backslashes, in JSON-escaped text), with `:` or `,` (`",jo"@x.test` keeps `,jo"`; `jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is the shape of a JSON separator and is never read as a quoted local part. In a valid JSON document the text between two strings always has this shape, whatever value lies between them (`": "`, `", "`, `": 1, "`, `": [true, "`, `": 7}, "`), so a key, a previous value or JSON punctuation is never joined to an address by a quoted-string reading. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) and ones with `,` or `:` later (`"a,b"`) are still quoted local parts.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only: an inner payload of twice-encoded JSON may stop parsing. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only, and only while no JSON NUMBER literal is itself an identifier: an inner payload of twice-encoded JSON may stop parsing, and a number of 8 or more digits (`{"n": 123456789}`, `0.1234567890123`) is replaced by an UNQUOTED surrogate, so the document no longer parses. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
   - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
@@ -249,9 +249,20 @@ domains) and PHP-escapes every slash.
 
 **JSON punctuation is never a quoted local part.** `{"k": "ana@x.test"}` was redacted to
 `{"[EMAIL:…]"}`: the grammar read `k": "ana` as atext `k`, the quoted string `": "` and
-atext `ana`, so the span swallowed the key. A quoted string that is a JSON separator
-(whitespace and `[` `]` `{` `}` around at least one `:` or `,`) is no longer a quoted
-local part.
+atext `ana`, so the span swallowed the key. Round 5 excluded only quoted strings made of
+punctuation alone, so a separator holding a NON-STRING value (`": 1, "`, `", 1, "`,
+`": [1, "`, `": 7}, "`) was still read as a quoted string: `{"a": [1, "ana@x.test"]}`
+and `[{"id": 7}, "ana@x.test"]` redacted to text that no longer parsed, with
+verified=True. Now a quoted string whose content STARTS, after optional whitespace and
+`[` `]` `{` `}`, with `:` or `,` is never a quoted local part. Between two strings of a
+valid JSON document the text always starts that way, whatever value lies between them.
+The price is declared: a real quoted local part starting with `,` or `:`
+(`",jo"@x.test`) keeps that quoted string. A further property builds random JSON trees
+of strings holding identifiers, numbers, booleans, null, and nested arrays and objects,
+and checks that the redacted document verifies, parses, and keeps every non-string value
+and the nesting exactly. Numbers in that property stay below 8 digits: a JSON number of
+8+ digits IS read as an account/routing/card and replaced by an unquoted surrogate, so
+that document stops parsing (declared under "Encoded text").
 A property puts every identifier kind, with TAB/LF/CR separators, into
 `json.dumps({"k": t})` / `json.dumps([t, "x"])` and checks that no 4-character
 fragment survives in the decoded redacted value. Over-redaction grows accordingly: lines

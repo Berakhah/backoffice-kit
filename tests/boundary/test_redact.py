@@ -1613,3 +1613,173 @@ def test_a_json_separator_is_never_a_quoted_local_part() -> None:
     assert 'jo", "' in r.text
     whole = redact(_cc('mail jonathan" "smith@x.test now'), key=KEY)
     assert _leftover(whole.text) == "mail " + chr(0) + " now", whole.text
+
+
+# --- Task 10 step 0 (carried Task 8b breaker ruling): non-string neighbouring values ------
+#
+# The round-5 exclusion covered only punctuation-only quoted strings, so a JSON separator
+# that holds a NON-STRING value (': 1, ', ', 1, ', ': [1, ', ': 7}, ') was still read as a
+# quoted local part and swallowed the key or the previous value into the email's span:
+# {"a": [1, "ana@x.test"]} redacted to text that no longer parsed, with verified=True.
+# Any quoted string whose content starts (after whitespace and brackets) with ':' or ','
+# is now not a quoted local part.
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"a": [1, "ana@x.test"]},
+        {"a": [True, "ana@x.test"]},
+        {"a": [None, "ana@x.test"]},
+        [{"id": 7}, "ana@x.test"],
+        {"rows": [{"n": 1}, "ana@x.test"]},
+        ["jonathan", {"a": 1}, "smith@x.test"],  # regression vs 4bcec16
+        ["x", 1, "ana@x.test"],
+        ["x", 1.5, "ana@x.test"],
+        ["x", -1, "ana@x.test"],
+        ["x", [1, 2], "ana@x.test"],
+        ["x", {}, "ana@x.test"],
+        {"a": 1, "b": "ana@x.test"},
+        {"name": "jonathan", "n": 5, "e": "smith@x.test"},
+        ["a", 1, 2, "ana@x.test"],
+    ],
+)
+@pytest.mark.parametrize("compact", [False, True])
+def test_a_non_string_neighbour_is_never_swallowed_into_an_email(
+    obj: dict[str, object] | list[object], compact: bool
+) -> None:
+    separators = (",", ":") if compact else None
+    document = json.dumps(obj, separators=separators)
+    r = redact(_cc(document), key=KEY)
+    assert r.verified is True, r.failures
+    loaded = json.loads(r.text)
+    assert _shape(loaded) == _shape(obj), (document, r.text)
+    assert "ana" not in _leftover(r.text) and "smith" not in _leftover(r.text)
+
+
+def _shape(value: object) -> object:
+    """The JSON structure with every string replaced by one marker: non-string values,
+    keys' count and nesting must survive redaction exactly."""
+    if isinstance(value, str):
+        return "S"
+    if isinstance(value, list):
+        return [_shape(v) for v in value]
+    if isinstance(value, dict):
+        return [("S", _shape(v)) for v in value.values()]
+    return value
+
+
+# Numbers stay below 8 digits: a JSON number literal that IS an identifier (8+ digits) is
+# replaced by an unquoted surrogate (declared in the contract), which is not what this
+# property is about.
+_JSON_SCALAR = st.one_of(
+    _JSON_VALUE,
+    st.integers(min_value=-999_999, max_value=999_999),
+    st.floats(min_value=-9_999, max_value=9_999, allow_nan=False).map(lambda f: round(f, 2)),
+    st.booleans(),
+    st.none(),
+)
+_JSON_TREE = st.recursive(
+    _JSON_SCALAR,
+    lambda children: st.one_of(
+        st.lists(children, max_size=4),
+        st.dictionaries(st.from_regex(r"[a-z]{1,6}", fullmatch=True), children, max_size=4),
+    ),
+    max_leaves=12,
+)
+
+
+@settings(max_examples=500, deadline=None)
+@given(
+    obj=st.one_of(
+        st.lists(_JSON_TREE, min_size=1, max_size=5),
+        st.dictionaries(
+            st.from_regex(r"[a-z]{1,6}", fullmatch=True), _JSON_TREE, min_size=1, max_size=5
+        ),
+    ),
+    ensure_ascii=st.booleans(),
+    compact=st.booleans(),
+)
+def test_redacted_json_with_any_neighbouring_values_keeps_its_structure(
+    obj: object, ensure_ascii: bool, compact: bool
+) -> None:
+    """Numbers, booleans, null, nested arrays and objects as neighbours of identifiers:
+    the redacted document verifies, parses, and keeps every non-string value and the
+    nesting exactly; only string contents change."""
+    separators = (",", ":") if compact else None
+    r = redact(_cc(json.dumps(obj, ensure_ascii=ensure_ascii, separators=separators)), key=KEY)
+    assert r.verified is True, r.failures
+    assert _shape(json.loads(r.text)) == _shape(obj), r.text
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    email=_email(),
+    before=st.one_of(_JSON_TREE, st.just("jonathan")),
+    after=_JSON_TREE,
+)
+def test_an_email_among_non_string_values_leaves_no_local_part_word(
+    email: str, before: object, after: object
+) -> None:
+    """The depth-1 email guarantee with non-string neighbours in the same array."""
+    local = email.rsplit("@", 1)[0]
+    words = set(re.findall(r"[A-Za-z0-9]{4,}", local))
+    document = json.dumps([before, email, after])
+    others = json.dumps([before, after])
+    r = redact(_cc(document), key=KEY)
+    assert r.verified is True, r.failures
+    assert _shape(json.loads(r.text)) == _shape([before, email, after]), r.text
+    for word in words - {w for w in words if w in others}:
+        assert word not in _leftover(r.text), (document, r.text)
+
+
+def test_a_quoted_local_part_starting_with_a_separator_is_a_declared_gap() -> None:
+    """DECLARED GAP, pinned: a quoted string whose content starts (after whitespace and
+    brackets) with ',' or ':' is never a quoted local part, so '",jonathan"@x.test' keeps
+    ',jonathan"' -- the price of never reading a JSON separator as an address."""
+    r = redact(_cc('mail ",jonathan"@x.test now'), key=KEY)
+    assert r.verified is True
+    assert "jonathan" in r.text
+    whole = redact(_cc('mail "jonathan,"@x.test now'), key=KEY)  # ',' later: covered
+    assert "jonathan" not in _leftover(whole.text), whole.text
+
+
+@pytest.mark.parametrize(
+    ("content", "is_separator"),
+    [
+        (": 1, ", True),
+        (", 1, ", True),
+        ("]}, ", True),
+        (" \t: ", True),
+        (",jo", True),
+        ("[jo", False),
+        ("{jo}", False),
+        (" jo", False),
+        ("jo, ", False),
+        ("a:b", False),
+    ],
+)
+def test_the_separator_lookaheads_test_only_the_start_of_the_content(
+    content: str, is_separator: bool
+) -> None:
+    """Pinned directly: the other scans can mask a broken lookahead (a missing backslash
+    in the escaped form turned its bracket class into a single character test and every
+    property still passed). The escaped form also skips backslashes."""
+    import bok_core.boundary.redact as m
+
+    assert (re.match(m._NOT_PUNCTUATION, content) is None) is is_separator
+    backslash = chr(92)
+    escaped = content.replace(" ", backslash + " ").replace("[", backslash + "[")
+    assert (re.match(m._NOT_ESCAPED_PUNCTUATION, escaped) is None) is is_separator
+
+
+def test_a_json_number_that_is_an_identifier_breaks_the_document_declared() -> None:
+    """DECLARED, pinned: the valid-JSON claim holds only while no JSON number literal is
+    itself an identifier. A 9-digit number is a routing number; its surrogate is written
+    unquoted, so the document no longer parses. Callers redact values before
+    serialising."""
+    r = redact(_cc(json.dumps({"n": 123456789})), key=KEY)
+    assert r.verified is True
+    assert "123456789" not in r.text
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(r.text)
