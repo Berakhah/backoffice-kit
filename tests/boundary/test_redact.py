@@ -855,10 +855,22 @@ _DIFF_TOKENS = [
     "ana@x.test",
     '"jo smith"@x.test',
     "jo(c)@x.test",
+    # quoted strings longer than 65 characters: a quoted-pair is 2 characters per item
+    '"' + _BS + "a" * 1 + (_BS + "a") * 39 + ' smith"@x.test',
+    '"x' + _BS * 2 + (_BS + "q") * 35 + ', jonathan"@x.test',
+    (_BS + "a") * 30,
+    _BS + '"jo smith' + _BS + '"@x.test',
 ]
-_DIFF_CORPUS = st.one_of(
+_DIFF_PLAIN = st.one_of(
     st.lists(st.sampled_from(_DIFF_CHARS), min_size=1, max_size=40).map("".join),
     st.lists(st.sampled_from(_DIFF_TOKENS + _DIFF_CHARS), min_size=1, max_size=14).map("".join),
+)
+# Plain, and wrapped as JSON evidence is stored: once, as an object value, and twice.
+_DIFF_CORPUS = st.one_of(
+    _DIFF_PLAIN,
+    _DIFF_PLAIN.map(json.dumps),
+    _DIFF_PLAIN.map(lambda t: json.dumps({"dom": t, "cc": "bob"})),
+    _DIFF_PLAIN.map(lambda t: json.dumps(json.dumps(t))),
 )
 
 
@@ -874,6 +886,7 @@ def _reference_email_cover(text: str) -> set[int]:
         "x " + "a" * 70 + '"q"@x.test',  # the 64-item cap binds inside the run
         '"q" ' + "b" * 80 + "@x.test",
         "(c) " + "c" * 90 + '(d)"q"@x.test',
+        'x "ab' + chr(10) + "cd ef@x.test",  # a line break between the quote and the breaker
     ],
 )
 def test_the_64_item_cap_gives_the_same_start_as_the_reference_scan(text: str) -> None:
@@ -888,12 +901,78 @@ def test_the_64_item_cap_gives_the_same_start_as_the_reference_scan(text: str) -
 @settings(max_examples=1500, deadline=None)
 @given(raw=_DIFF_CORPUS)
 def test_the_fast_email_scan_covers_everything_the_reference_scan_covers(raw: str) -> None:
+    """For EVERY email scan (RFC quoting, JSON-escaped quoting, nested-JSON quoting) the
+    reference is that scan's own pattern applied position by position."""
     import bok_core.boundary.redact as m
 
     text = m._normalise(raw)
-    fast = {i for start, end in m._find_emails(text) for i in range(start, end)}
-    missed = _reference_email_cover(text) - fast
-    assert not missed, (text, "".join(text[i] for i in sorted(missed)))
+    for scan in m._EMAIL_SCANS:
+        reference = {
+            i
+            for mt in scan.pattern.finditer(text)
+            # the declared window: a local part starting > 256 before its "@" is not covered
+            if scan.parse(text, mt.start())[0] - mt.start() <= m._EMAIL_LOOKBACK
+            for i in range(*mt.span())
+        }
+        fast = {i for start, end in scan.find(text) for i in range(start, end)}
+        missed = reference - fast
+        assert not missed, (scan.name, text, "".join(text[i] for i in sorted(missed)))
+    if chr(92) not in text:  # without a backslash the scans cannot differ (_only_with_backslash)
+        results = {tuple(scan.find(text)) for scan in m._EMAIL_SCANS}
+        assert len(results) == 1, (text, results)
+
+
+# --- Task 8b fix round 3 ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        json.dumps({"dom": 'mail "jonathan smith"@x.test now'}),
+        json.dumps({"dom": '"jonathan"@x.test'}),
+        json.dumps({"to": '"jo smith"@x.test', "cc": "bob"}),
+        json.dumps(['"jonathan smith"@x.test']),
+        'x=\\"jonathan smith\\"@x.test y "z"',
+        '<a title="\\"jonathan smith\\"@x.test">',
+        json.dumps(json.dumps({"dom": 'mail "jonathan smith"@x.test now'})),  # twice-encoded
+        json.dumps({"dom": '"jo\\"nathan"@x.test'}),  # a quoted-pair inside, then JSON
+    ],
+)
+def test_a_quoted_local_part_inside_json_is_redacted(text: str) -> None:
+    """The RFC quoted string commits whenever any later unescaped quote exists on the
+    line -- true of every real JSON document -- so the JSON form was never tried."""
+    r = redact(_cc(text), key=KEY)
+    assert r.verified is True
+    for word in ("jonathan", "smith", "nathan"):
+        assert word not in r.text, r.text
+
+
+_BS2 = chr(92)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '"' + (_BS2 + "a") * 40 + ' smith"@x.test',  # reference (0, 95); fast had (88, 95)
+        '"x' + _BS2 * 2 + (_BS2 + "q") * 35 + ', jonathan"@x.test',
+        "mail "
+        + '"'
+        + _BS2 * 2
+        + _BS2.join(["fileserver01", "departments", "accounts", "payable", "jonathan smith"])
+        + '"@x.test now',
+    ],
+)
+def test_a_quoted_string_longer_than_65_characters_is_not_cut(text: str) -> None:
+    """A quoted-pair is 2 characters, so 64 items span up to 129; the enclosure bound
+    counted 65 characters and cut the window inside the string."""
+    import bok_core.boundary.redact as m
+
+    reference = [mt.span() for mt in m._DETECTORS["email"].finditer(text)]
+    assert list(m._find_emails(text)) == reference
+    r = redact(_cc(text), key=KEY)
+    assert r.verified is True
+    for word in ("smith", "jonathan", "fileserver01"):
+        assert word not in r.text, r.text
 
 
 # --- Properties -------------------------------------------------------------------------
@@ -1118,3 +1197,25 @@ def test_adjacent_identifiers_leave_no_fragment(
     for (_, value), joiner in zip(tagged[1:], joiners, strict=False):
         doc += joiner + value
     _assert_redacted(doc + ">>", tagged, exact_kinds=False)
+
+
+# --- JSON evidence property (needs the strategies above) ---------------------------------
+
+_WORDS = st.from_regex(r"[a-z ]{0,16}", fullmatch=True)
+
+
+@settings(max_examples=300, deadline=None)
+@given(prefix=_WORDS, email=_email(), suffix=_WORDS)
+def test_an_email_embedded_in_json_evidence_leaves_no_local_part_word(
+    prefix: str, email: str, suffix: str
+) -> None:
+    """Evidence is stored as JSON. Whatever covered email sits in the text, the JSON form
+    of that text must lose every local-part word of 4+ characters."""
+    text = f"{prefix} {email} {suffix}"
+    local = email.rsplit("@", 1)[0]
+    words = {w for w in re.findall(r"[A-Za-z0-9]{4,}", local) if w not in text.replace(email, "")}
+    for document in (json.dumps({"k": text}), json.dumps([text, "x"])):
+        r = redact(_cc(document), key=KEY)
+        assert r.verified is True, r.failures
+        for word in words:
+            assert word not in r.text, (document, r.text)

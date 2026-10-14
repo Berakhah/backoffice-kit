@@ -131,6 +131,8 @@ are equal.
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
+- Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
+- JSON escaping deeper than 8 backslashes in a row (a string encoded more than about three times) is not read as escaping.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
 - A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
 - Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
@@ -185,6 +187,25 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
   fragment of either survives, property-tested), but they merge into one span with one
   surrogate.
 
+### Emails inside JSON evidence
+
+Evidence is stored as JSON, which escapes the quotes of a quoted local part:
+`"jo smith"@x.test` becomes `\"jo smith\"@x.test`. Four email scans run, and their
+spans are redacted as a union:
+1. RFC quoting first;
+2. JSON-escaped quoting first (a string ends at `\"`);
+3. multiply-escaped quoting first (a string ends at any run of 1–8 backslashes before a
+   quote);
+4. literal quoting first (`"C:\dir\"@x.test`).
+
+One grammar cannot hold them all, because inside the possessive local part the first
+quoted form that matches is final.
+
+Without a backslash anywhere in the text the four scans are provably identical, so only
+the first runs. Each scan is exact against its own pattern applied position by position;
+a differential property test checks all four over plain, JSON-wrapped and twice-encoded
+corpora.
+
 ### Performance (measured; Python 3.12, Windows, one core)
 
 The email scan is driven from each `@` (`str.find`). For each `@`:
@@ -192,20 +213,19 @@ The email scan is driven from each `@` (`str.find`). For each `@`:
 - without quotes, parentheses or backslashes, the start is found by walking back over
   the local part;
 - otherwise only parse entry points are tried, after the window is cut at the last
-  character no quoted string or comment can enclose.
-
-It finds exactly what the email pattern finds when applied position by position. A
-differential property test checks this against that reference scan.
+  character no quoted string or comment can enclose. The bound on how far a quoted string
+  can reach is derived from the patterns themselves (`_QUOTED_MAX`).
 
 | Input (1 MB unless stated) | `redact()` total | email scan alone |
 |---|---|---|
-| realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.1 s | 0.03 s / pass |
+| realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.2 s | 0.04 s / pass |
+| JSON evidence `{\"to\":\"jo smith\"@x.test\"}` repeated | 2.9 s | |
 | `a@` repeated | 1.8 s | |
 | `(a)@` repeated | 2.6 s | |
-| `\"@` repeated | 4.9 s | |
 | `"` + 254×`a` + `"@` repeated | 5.2 s | |
 | `"a"(b)` ×10 + `@ ` repeated | 13.4 s | |
-| `"a"@` repeated | 16.0 s | 0.77 s / 100k |
+| `\"@` repeated (backslashes: all four scans run) | 14.6 s | |
+| `"a"@` repeated | 16.5 s | 0.77 s / 100k |
 
 Every case scales linearly (`test_hostile_input_scales_linearly`: 10× the input costs
 under 20× the time). The dense quoted cases are a constant-factor cost of exact matching:

@@ -217,6 +217,8 @@ As of 0.2.6 (Task 8b hardening):
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
   - with comments nested more than one level deep.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
+- Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
+- JSON escaping deeper than 8 backslashes in a row (a string encoded more than about three times) is not read as escaping.
 - A character that is invalid in an unquoted local part (space, `,` `;` `<` `>` `\` `[` `]` `:`) ends it, and the text before it is not redacted.
 - A lower- or mixed-case gapped IBAN country code (`gb 82 ...`) is recognised only when its BBAN has at least 8 digits, and only as a word of its own. Glued directly after a letter (`...testgb 82 west ...`), it is not recognised: its letters, its check digits and short digit tails (e.g. `001`) can survive; only digit runs long enough for another detector are redacted.
 - Parenthesised letters U+249C-U+24B5 (NFKD expands them to `(a)` ... `(z)`) inside an IBAN break it.
@@ -243,6 +245,17 @@ As of 0.2.8 (Task 8b fix round 2):
 - JSON-escaped quoted local parts (`\"jo smith\"@x.test`) are redacted.
 - A domain literal never matches a surrogate.
 - Measured performance figures are in `docs/methodology.md`.
+
+As of 0.2.9 (Task 8b fix round 3):
+- Emails are found by four scans whose spans are redacted as a union: RFC quoting
+  first, JSON-escaped first, multiply-escaped first, literal first. A possessive local
+  part commits to its first quoted form, so one grammar could not hold them all.
+- Quoted local parts inside JSON evidence are redacted.
+- The enclosure bound `_QUOTED_MAX` is derived from the quoted-string patterns: a
+  quoted-pair is 2 characters, so 64 items reach 129. The hand-written 65 cut such
+  strings and leaked them.
+- Two declared gaps are added: overlapping addresses, and escape runs over 8
+  backslashes.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -897,6 +910,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.9 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 3. No symbol changes.** (1) JSON-escaped quoted local parts are redacted again. The JSON form had sat behind the RFC form inside a possessive repetition and was never tried on real JSON. Now four email scans (RFC-, JSON-, nested-JSON-, literal-first) are unioned; with no backslash in the text only the first runs, and the result is provably identical. (2) `_QUOTED_MAX` is derived from the patterns; 65 characters cut quoted strings of quoted-pairs (64 items reach 129). (3) The differential property covers every scan over plain, JSON-wrapped and twice-encoded corpora. (4) Declared: overlapping addresses, and escape runs over 8 backslashes. Performance re-measured: realistic 1.1 MB DOM 1.2 s, backslash-dense adversarial 14.6 s/MB, linear. |
 | 0.2.8 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 2. No symbol changes.** (1) The @-driven email scan is now exact against the position-by-position pattern scan (within the 256-character window), with a differential property test. A miss no longer advances the scan: an inner `@` preceded by a non-local-part character had cut off the real address (`"john smith@acme"@x.test`). (2) JSON-escaped quoted local parts are redacted. (3) The enclosing match wins over an inner email. (4) Domain literals exclude surrogates, so 4+ glued `@` no longer exhaust the passes. (5) Declared: domain-literal over-redaction of code-like text, and measured performance (realistic 1.1 MB DOM 1.1 s; dense adversarial quoted input up to 16 s/MB, linear). The glued-letter country-code wording was corrected. |
 | 0.2.7 | 2026-10-14 | **§1.3 `redact` — Task 8b fix round 1. No symbol changes; three covered-class leaks closed.** (1) Lower/mixed-case gapped IBAN country codes are accepted when standing alone with a digit-heavy BBAN (≥ 8 digits); prose such as `on 12 March 2026` is untouched. (2) Quoted-pair local parts, one level of comment nesting, and domain literals are redacted whole. (3) The email scan is driven from each `@` with a bounded backward window (a 1.1 MB DOM snapshot went from 0.9 s to ~2 ms per pass). U+2550 is mapped. The declared-gaps list is reworded and extended (local parts over 64 characters, parenthesised letters, letter-glued lower-case country codes, invalid local-part characters). |
 | 0.2.6 | 2026-10-14 | **§1.3 `redact` — Task 8b hardening. No symbol changes; detection widened.** (1) A supplementary `iban` pattern for national display formats (groups of any width, an optional gap after an upper-case country code, 11–30 BBAN letters/digits). (2) Email local parts take full RFC 5322 atext, quoted strings, comments and `Mc` letters (possessive and gated to 256 characters before the `@`, so they stay linear). (3) Lookalike slashes, full stops and dash-likes map into the gap set. (4) `Cs`, `Co` and `Cn` are stripped, so the output is always encodable. (5) The canonical declared-gaps list now lives in §1.3 and `docs/methodology.md` between `declared-gaps` markers, kept identical by a test. It adds digit-valued `No` characters without an NFKD digit form. U+00B7 and U+2022 move from not-covered to mapped. |
