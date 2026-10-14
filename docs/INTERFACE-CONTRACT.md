@@ -148,11 +148,26 @@ detector over the output**. Three corrections to v0.1, each closing a real hole:
 Further, as of 0.2.3:
 - `key` must be at least 32 bytes; a shorter key raises `ValueError` whose message never echoes it.
 - Input is normalised before detection (NFKC; Unicode spaces → space; Unicode dashes and U+2212 →
-  hyphen; format characters such as U+200B removed). **`text` is the normalised text**, and
-  surrogates are computed on the normalised identifier.
+  hyphen; removed: `Cf`, `Default_Ignorable_Code_Point` (Unicode 15.0.0), U+2800, and combining
+  marks after a digit or separator). **`text` is the normalised text, including non-identifier
+  text** (ligatures, superscripts, full-width forms, bidi marks, ZWJ in emoji). No offset map into
+  the original is provided.
 - `RedactionResult.text` is excluded from `repr()`/`str()` (a failed result still holds the
   surviving identifier). `model_dump()` includes it; a caller persisting an unverified result's
   text treats it as `CLIENT_CONFIDENTIAL` and routes it through `egress`.
+
+As of 0.2.4:
+- Surrogates are HMAC'd over the **canonical** identifier (digits only for digit kinds,
+  separator-free upper case for IBAN, lower case for email), so one identifier shares a surrogate
+  across layouts and case. A **merged span** (identifiers glued or overlapping) gets one surrogate
+  that is NOT any standalone identifier's surrogate, and the same digits under different labels
+  get different surrogates.
+- Digit detectors accept a gap of 0–3 characters from whitespace (incl. TAB/LF), `.`, `-`, `/`
+  between digits; every run of 8+ digits so joined is redacted. IBAN detection is
+  case-insensitive.
+- **Over-redaction is the declared bias**: dates, IP addresses, rows of small numbers and prices,
+  hex hashes/SKUs, and short words after an IBAN-like prefix are redacted. The full list is in
+  `docs/methodology.md`.
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -807,6 +822,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.4 | 2026-10-14 | **§1.3 `redact`. No symbol changes; detection widened (over-redaction bias), surrogates canonicalised.** (1) `phone` gaps are independent (0.2.3's matching-separator rule let `555 010-0100` through). (2) Digit detectors accept a 0–3 character gap of whitespace (TAB/LF included), `.`, `-` and `/`; `account` spans 8–12 digits with gaps. (3) Normalisation also strips `Default_Ignorable_Code_Point` (Unicode 15.0.0), U+2800, and combining marks after a digit or separator. (4) IBAN detection is case-insensitive. (5) The HMAC input is the canonical identifier, so one identifier shares a surrogate across layouts and case. A merged span's surrogate is not a standalone one. (6) Declared: the over-redaction shapes, normalised non-identifier text, and the absence of an offset map. |
 | 0.2.3 | 2026-10-14 | **§1.3 `redact` — no symbol changes; semantics tightened.** (1) The claim that verification catches "an identifier the first pass split, overlapped, or never had a pattern for" was wrong: verification only catches what a covered detector still recognises in the output. The mangling case is now prevented structurally (all detectors over the same text, overlapping spans merged and replaced whole). (2) `key` must be ≥ 32 bytes. (3) Input is Unicode-normalised before detection and `text` is the normalised text. (4) `RedactionResult.text` is excluded from `repr()`/`str()`. Coverage changes are declared in `docs/methodology.md`: added `digit_run` (20+ digits), `account` widened to 8–12 digits, spaced IBANs, and dot separators for cards. |
 | 0.2.2 | 2026-10-14 | **Clarification, no symbol changes.** §2.4 now states the `to_rail()` payload shape: `RailPayload` keys (`root`, `depth`, `inherited_caveats`) and the twelve `RailNode` keys, pinned by `tests/provenance/test_render.py` (`extra="forbid"`; a `Decimal` value is a JSON string; leaf depth is 1; shared ancestors nest under each child rather than being referenced by id). Recorded retroactively — the §2.4 text landed with Task 6 (bf5e2d4) without this row. |
 | 0.2.1 | 2026-10-14 | **Clarifications, no symbol changes.** (1) `Claim.parents` bare annotation does NOT preserve parent instance identity (revalidation creates fresh instances); §2.1 corrected. (2) §2.3 states the None-confidence rule: unscored `MODEL`/`DERIVED` parent makes the child's confidence `None`; `DETERMINISTIC`/`HUMAN` do not lower the floor. |

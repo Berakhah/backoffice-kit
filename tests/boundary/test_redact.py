@@ -252,20 +252,98 @@ def test_a_short_key_is_refused_without_echoing_it() -> None:
     redact(_cc(DOC), key=weak + b"x")  # exactly 32 is accepted
 
 
+# --- Fix round 2 ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("phone", ["555 010-0100", "555.010-0100", "555-010 0100", "555/010.0100"])
+def test_a_phone_with_mixed_separators_is_redacted(phone: str) -> None:
+    """Round 1's backreference demanded matching separators: these passed unchanged."""
+    r = redact(_cc(f"phone {phone} end"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"phone": 1}
+    assert not _fragments(phone) & _fragments(_leftover(r.text))
+
+
+@pytest.mark.parametrize(
+    ("variant", "kind"),
+    [
+        ("4111  1111 1111 1111", "card"),  # double space
+        ("4111\t1111\t1111\t1111", "card"),  # innerText of a table row
+        ("4111\n1111\n1111\n1111", "card"),  # one group per line
+        ("4111 - 1111 - 1111 - 1111", "card"),
+        ("4111/1111/1111/1111", "card"),
+        ("4111 \t1111\r\n1111.-1111", "card"),
+        ("1234 5678 9012", "account"),  # 12 spaced digits matched no detector
+        ("1234\t5678", "account"),
+    ],
+)
+def test_digit_groups_split_by_wider_separators_are_redacted(variant: str, kind: str) -> None:
+    r = redact(_cc(f"ref {variant} end"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {kind: 1}
+    for group in re.split(r"\D+", variant):
+        assert group not in _leftover(r.text).replace("ref", "").replace("end", "")
+
+
+@pytest.mark.parametrize(
+    "invisible",
+    [
+        "\u034f",  # combining grapheme joiner (Mn, default-ignorable)
+        "\ufe0f",  # variation selector-16 (Mn, default-ignorable)
+        "\U000e0101",  # variation selector-18 (Mn, default-ignorable)
+        "\u2800",  # braille pattern blank (So)
+        "\u3164",  # hangul filler (Lo; NFKC -> U+1160)
+        "\u1160",  # hangul jungseong filler (Lo, default-ignorable)
+        "\u115f",  # hangul choseong filler (Lo, default-ignorable)
+        "\uffa0",  # halfwidth hangul filler (Lo, default-ignorable)
+        "\u17b4",  # khmer vowel inherent aq (Mn, default-ignorable)
+        "\u180e",  # mongolian vowel separator (Cf)
+        "\U000e0041",  # tag latin capital A (Cf, default-ignorable)
+        "\U0001d173",  # musical symbol begin beam (Cf, default-ignorable)
+        "\u0301",  # combining acute accent (Mn) between digits
+        "\u0301\u0302",  # a stack of combining marks
+    ],
+)
+def test_invisible_characters_between_digits_do_not_defeat_detection(invisible: str) -> None:
+    plain = redact(_cc("routing 021000021 end"), key=KEY)
+    r = redact(_cc(f"routing 021{invisible}000{invisible}021 end"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"routing": 1}
+    assert r.text == plain.text
+
+
+@pytest.mark.parametrize(
+    ("one", "two"),
+    [
+        ("GB82 WEST 1234 5698 7654 32", "GB82WEST12345698765432"),
+        ("gb82 west 1234 5698 7654 32", "GB82WEST12345698765432"),
+        ("555-010-0100", "(555) 010 0100"),
+        ("555-010-0100", "555.010.0100"),
+        ("4111 1111 1111 1111", "4111111111111111"),
+        ("ana@x.test", "ANA@X.TEST"),
+    ],
+)
+def test_one_identifier_shares_a_surrogate_across_layouts_and_case(one: str, two: str) -> None:
+    """Joins survive layout: the HMAC input is the canonical identifier, not the text."""
+    a = redact(_cc(f"<{one}>"), key=KEY)
+    b = redact(_cc(f"<{two}>"), key=KEY)
+    assert a.verified and b.verified
+    assert a.text == b.text
+
+
 # --- Properties -------------------------------------------------------------------------
 
-_SEP = st.sampled_from([" ", "-", ".", ""])
+_SEP = st.sampled_from([" ", "-", ".", "", "\t", "\n", "  ", " - ", "/", "\r\n"])
 
 
 @st.composite
 def _phone(draw: st.DrawFn) -> str:
-    sep = draw(_SEP)
     area = draw(st.from_regex(r"[0-9]{3}", fullmatch=True))
     area = f"({area})" if draw(st.booleans()) else area
     cc = draw(st.sampled_from(["", "+1 ", "+44-", "+353"]))
     a = draw(st.from_regex(r"[0-9]{3}", fullmatch=True))
     b = draw(st.from_regex(r"[0-9]{4}", fullmatch=True))
-    return f"{cc}{area}{draw(_SEP) if area[0] == '(' else sep}{a}{sep}{b}"
+    return f"{cc}{area}{draw(_SEP)}{a}{draw(_SEP)}{b}"  # separators independent
 
 
 @st.composite
@@ -305,8 +383,23 @@ def _noisy(draw: st.DrawFn, tagged: tuple[str, str]) -> tuple[str, str]:
         else:
             out.append(ch)
         if ch.isdigit():
-            out.append(draw(st.sampled_from(["", "", "", "", "\u200b", "\u00ad", "\u2060"])))
+            out.append(draw(st.sampled_from(_BETWEEN_DIGITS)))
     return kind, "".join(out)
+
+
+_BETWEEN_DIGITS = [
+    *[""] * 8,
+    "\u200b",  # zero-width space (Cf)
+    "\u00ad",  # soft hyphen (Cf)
+    "\u2060",  # word joiner (Cf)
+    "\u034f",  # combining grapheme joiner (Mn, default-ignorable)
+    "\ufe0f",  # variation selector-16
+    "\u2800",  # braille pattern blank
+    "\u3164",  # hangul filler
+    "\uffa0",  # halfwidth hangul filler
+    "\u0301",  # combining acute accent
+    "\U000e0041",  # tag character
+]
 
 
 def _assert_redacted(doc: str, tagged: list[tuple[str, str]], *, exact_kinds: bool) -> None:
@@ -319,7 +412,8 @@ def _assert_redacted(doc: str, tagged: list[tuple[str, str]], *, exact_kinds: bo
         normal = m._normalise(value)
         assert not _fragments(normal) & _fragments(left), (normal, r.text)
     if exact_kinds:
-        expected = Counter(kind for kind, _ in {(k, m._normalise(v)) for k, v in tagged})
+        canonical = {(k, m._canonical(k, m._normalise(v))) for k, v in tagged}
+        expected = Counter(kind for kind, _ in canonical)
         assert r.surrogate_count == dict(expected)
 
 

@@ -55,12 +55,15 @@ class RedactionFailed(Exception):
     """Verification did not pass. This text is not safe to treat as REDACTED."""
 
 
-# Separators the digit detectors accept BETWEEN digits, after normalisation: exactly one
-# ASCII space, hyphen or dot. Every Unicode space (Zs) and dash (Pd, U+2212) has already
-# been mapped onto these, and format characters (Cf: zero-width space, soft hyphen, word
-# joiner, BOM...) removed, so the set is small and explicit. Tabs and newlines are NOT
-# separators.
-_SEP = r"[ .\-]"
+# What the digit detectors accept BETWEEN two digits, after normalisation: nothing, or a
+# run of 1-3 characters drawn from whitespace (space, TAB, CR, LF -- innerText of a table
+# row is tab-separated), '.', '-' and '/'. So "4111  1111", "4111\t1111", "4111 - 1111"
+# and "4111/1111" are all one run. Every Unicode space (Zs) and dash (Pd, U+2212) has
+# already been mapped onto ASCII, and invisible characters removed (_normalise). Round 1
+# accepted exactly one of space/hyphen/dot, and digit groups split any other way passed
+# through with verified=True. The cost is over-redaction: rows of small numbers, prices,
+# dates and IP addresses become `account`/`card`/`digit_run` (declared in methodology.md).
+_GAP = r"[\s./\-]{0,3}"
 
 # Person names and addresses need local NER (spaCy/GLiNER) and land in week 5. Until then
 # a document containing a person's name is not REDACTED; it is CLIENT_CONFIDENTIAL.
@@ -75,39 +78,43 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
     # keeps the scan linear on a long run of word characters with no "@".
     "email": re.compile(r"[\w.%+-]{0,64}@[\w.-]{1,255}\.[A-Za-z]{2,63}"),
     # Compact (NL91ABNA0417164300) or grouped in fours with single spaces
-    # (GB82 WEST 1234 5698 7654 32). Upper-case country code only. No left boundary at
+    # (GB82 WEST 1234 5698 7654 32). Case-insensitive ("gb82 west ..." is the same IBAN,
+    # and an upper-case-only shape leaked it). No left boundary at
     # all, and scanned for overlapping matches (_OVERLAPPING): "a@a.testGB68...",
     # "...0100GB00 0AAA..." and "...AAAAGB00 TTZO ..." must all still yield an IBAN match.
     # Compact: 11-128 characters with no trailing guard -- longer than the IBAN maximum of
     # 30 because two IBANs glued together are one token, and unguarded so a token longer
     # than 128 is consumed in bites rather than matched only at its end (with a guard,
     # "GB12GB12..." verification failed closed). Spaced: guarded, so the match never ends
-    # half-way through a group. The cost is over-redaction of long upper-case codes that
-    # contain two letters followed by two digits -- the safe direction.
+    # half-way through a group. The cost is over-redaction of long codes that contain two
+    # letters followed by two digits (hex hashes, SKUs) -- the safe direction.
     "iban": re.compile(
         r"[A-Z]{2}\d{2}"
-        r"(?:[A-Z0-9]{11,128}|(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,4})?(?![A-Z0-9]))"
+        r"(?:[A-Z0-9]{11,128}|(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,4})?(?![A-Z0-9]))",
+        re.IGNORECASE,
     ),
-    # Optional "+CC", then "(ddd)" or "ddd", then ddd and dddd. Without parentheses the two
-    # separators must AGREE (backreference): otherwise a Diners card "3056 930902 5904"
-    # contains the phone-shaped "930902 5904" -- still redacted whole by the merge, but
-    # LABELLED phone whenever that match is the longer one.
+    # Optional "+CC", then "(ddd)" or "ddd", then ddd and dddd, each gap independent.
+    # Round 1 forced the two gaps to AGREE (a backreference, to keep a Diners card
+    # "3056 930902 5904" from being labelled phone) and so "555 010-0100" passed through
+    # unredacted. Labels are the span merge's job: the card match is longer and wins.
     "phone": re.compile(
-        rf"(?:\+\d{{1,3}}{_SEP}?)?"
-        rf"(?:\(\d{{3}}\){_SEP}?\d{{3}}{_SEP}?\d{{4}}|\d{{3}}({_SEP}?)\d{{3}}\1\d{{4}})"
+        rf"(?:\+\d{{1,3}}{_GAP})?(?:\(\d{{3}}\)|\d{{3}}){_GAP}\d{{3}}{_GAP}\d{{4}}"
     ),
-    # 20+ digits with optional single separators. Without it a 20-digit run, or a spaced
-    # run longer than 19, left an unredacted tail.
-    "digit_run": re.compile(rf"\d(?:{_SEP}?\d){{19,}}"),
-    "card": re.compile(rf"\d(?:{_SEP}?\d){{12,18}}"),
+    # 20+ digits. Without it a 20-digit run, or a spaced run longer than 19, left a tail.
+    "digit_run": re.compile(rf"\d(?:{_GAP}\d){{19,}}"),
+    "card": re.compile(rf"\d(?:{_GAP}\d){{12,18}}"),
     # US EIN (12-3456789) and SSN/ITIN (123-45-6789) shapes, hyphenated only.
     "tax_id": re.compile(r"\d{2}-\d{7}|\d{3}-\d{2}-\d{4}"),
     "routing": re.compile(r"\d{9}"),
-    # 8-12 contiguous digits, so with `card` (13-19) and `digit_run` (20+) EVERY contiguous
-    # run of 8 or more digits is redacted. An isolated 11- or 12-digit run used to match
-    # nothing at all. On a 9- or 10-digit tie `routing` / `phone` keep the label by rank.
-    "account": re.compile(r"\d{8,12}"),
+    # 8-12 digits (gaps allowed), so with `card` (13-19) and `digit_run` (20+) EVERY run of
+    # 8 or more digits is redacted, however it is split. On a 9- or 10-digit tie
+    # `routing` / `phone` / `tax_id` keep the label by rank.
+    "account": re.compile(rf"\d(?:{_GAP}\d){{7,11}}"),
 }
+
+# Kinds whose identity is the digits alone: the HMAC input drops every separator, so
+# "555-010-0100" and "(555) 010 0100" share one surrogate and joins survive layout.
+_DIGIT_KINDS = frozenset({"phone", "digit_run", "card", "tax_id", "routing", "account"})
 
 # Detectors scanned for OVERLAPPING matches (a match may start inside another match of
 # the same detector). A compact IBAN's [A-Z0-9] run swallows the start of an IBAN glued
@@ -115,7 +122,8 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
 # after the first match, orphaning the second IBAN's groups. Bounded patterns only:
 # the cost is one attempt per start position, at most 128 characters each.
 _OVERLAPPING: dict[str, re.Pattern[str]] = {
-    kind: re.compile(rf"(?=({_DETECTORS[kind].pattern}))") for kind in ("iban",)
+    kind: re.compile(rf"(?=({_DETECTORS[kind].pattern}))", _DETECTORS[kind].flags)
+    for kind in ("iban",)
 }
 
 # Substitution can expose a new match (a surrogate's ']' newly satisfies the IBAN's
@@ -135,18 +143,56 @@ _HEX_TO_LETTERS = str.maketrans("0123456789abcdef", "abcdefghijklmnop")
 
 _MINUS_SIGN = "\u2212"  # category Sm, not Pd, but used as a dash in typeset numbers
 
+# Default_Ignorable_Code_Point, hard-coded from DerivedCoreProperties.txt of Unicode
+# 15.0.0 -- the version Python 3.12's unicodedata implements (unidata_version). Python
+# exposes no accessor for the property. Many are Cf (stripped anyway) but not all: CGJ
+# U+034F and the variation selectors are Mn, the Hangul fillers are Lo, and each of them
+# split a digit run invisibly and passed with verified=True.
+_DEFAULT_IGNORABLE: tuple[tuple[int, int], ...] = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+# Not default-ignorable, but render as blank: braille pattern blank (So). The Hangul
+# fillers are repeated here for the record; they are in the range table above.
+_ALSO_INVISIBLE = (0x2800, 0x3164, 0x1160, 0x115F, 0xFFA0)
+_INVISIBLE: frozenset[int] = frozenset(
+    {cp for lo, hi in _DEFAULT_IGNORABLE for cp in range(lo, hi + 1)} | set(_ALSO_INVISIBLE)
+)
+# A combining mark (Mn/Me) directly after one of these is dropped: it can only be there to
+# break a digit run ("021<U+0301>000021"), and it carries no meaning on a digit.
+_DIGIT_OR_GAP = frozenset("0123456789 \t\r\n./-")
+
 
 def _normalise(text: str) -> str:
     """NFKC (full-width digits -> ASCII), every Unicode space -> ' ', every dash and the
-    minus sign -> '-', format characters (zero-width etc.) removed.
+    minus sign -> '-', format characters (Cf) and other invisible characters removed, and
+    combining marks after a digit or separator removed.
 
-    The redacted OUTPUT is this normalised text, and surrogates are computed on the
-    normalised identifier, so '4111<NBSP>1111...' and '4111 1111...' share a surrogate.
+    The redacted OUTPUT is this normalised text -- including the text around identifiers,
+    so ligatures, superscripts, full-width forms, bidi marks and ZWJ in emoji are
+    normalised too. No offset map back into the original is provided.
     """
     out: list[str] = []
     for ch in unicodedata.normalize("NFKC", text):
         category = unicodedata.category(ch)
-        if category == "Cf":
+        if category == "Cf" or ord(ch) in _INVISIBLE:
+            continue
+        if category in ("Mn", "Me") and out and out[-1] in _DIGIT_OR_GAP:
             continue
         if category == "Zs":
             out.append(" ")
@@ -155,6 +201,19 @@ def _normalise(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _canonical(kind: str, identifier: str) -> str:
+    """The HMAC input: one identifier gets one surrogate whatever its layout or case.
+
+    Digit kinds -> the digits alone; IBAN -> separator-free upper case; email (and any
+    merged span labelled email) -> lower case.
+    """
+    if kind in _DIGIT_KINDS:
+        return "".join(ch for ch in identifier if ch.isdigit())
+    if kind == "iban":
+        return "".join(identifier.split()).upper()
+    return identifier.lower()
 
 
 def _merged_spans(text: str) -> list[tuple[int, int, str]]:
@@ -217,7 +276,10 @@ class RedactionResult(BaseModel):
 
 
 def _surrogate(kind: str, original: str, key: bytes) -> str:
-    digest = hmac.new(key, f"{kind}:{original}".encode(), sha256).hexdigest()[:12]
+    """Keyed on the CANONICAL identifier. A merged span (two identifiers glued together)
+    is canonicalised as one string, so its surrogate is not either standalone one's."""
+    canonical = _canonical(kind, original)
+    digest = hmac.new(key, f"{kind}:{canonical}".encode(), sha256).hexdigest()[:12]
     return f"[{kind.upper()}:{digest.translate(_HEX_TO_LETTERS)}]"
 
 
@@ -244,7 +306,7 @@ def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult:
         cursor = 0
         for start, end, kind in spans:
             original = text[start:end]
-            seen.setdefault(kind, set()).add(original)
+            seen.setdefault(kind, set()).add(_canonical(kind, original))
             parts += [text[cursor:start], _surrogate(kind, original, key)]
             cursor = end
         text = "".join([*parts, text[cursor:]])
