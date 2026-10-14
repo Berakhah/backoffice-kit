@@ -77,20 +77,27 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
     # Every part is length-bounded (RFC 5321: local 64, domain 255, label 63), which also
     # keeps the scan linear on a long run of word characters with no "@".
     "email": re.compile(r"[\w.%+-]{0,64}@[\w.-]{1,255}\.[A-Za-z]{2,63}"),
-    # Compact (NL91ABNA0417164300) or grouped in fours with single spaces
-    # (GB82 WEST 1234 5698 7654 32). Case-insensitive ("gb82 west ..." is the same IBAN,
-    # and an upper-case-only shape leaked it). No left boundary at
-    # all, and scanned for overlapping matches (_OVERLAPPING): "a@a.testGB68...",
-    # "...0100GB00 0AAA..." and "...AAAAGB00 TTZO ..." must all still yield an IBAN match.
-    # Compact: 11-128 characters with no trailing guard -- longer than the IBAN maximum of
-    # 30 because two IBANs glued together are one token, and unguarded so a token longer
-    # than 128 is consumed in bites rather than matched only at its end (with a guard,
-    # "GB12GB12..." verification failed closed). Spaced: guarded, so the match never ends
-    # half-way through a group. The cost is over-redaction of long codes that contain two
+    # Grouped in fours, every group -- the trailing 1-4 character group included --
+    # preceded by the same 0-3 character gap the digit detectors accept, so one shape
+    # covers compact (NL91ABNA0417164300: zero gaps), spaced, GB82-WEST-1234-...,
+    # GB82<TAB>WEST..., "MT84  MALT  ...  01S" and mixed layouts. Single spaces only left
+    # "GB82-WEST-[CARD]" and "MTLC  AST0  01S" behind. The grouped branch is tried FIRST:
+    # with compact first, "GB00000A00AAAAAA AAAA0" matched compact up to the space and
+    # stranded " AAAA0". Up to 31 groups (124 characters); IBANs glued at another
+    # 4-alignment are caught by the overlapping scan (_OVERLAPPING). Groups are a fixed
+    # 4 wide, so backtracking is bounded. Guarded, so a match never ends half-way
+    # through a group.
+    # Fallback: compact 11-128 characters, unguarded, so a token longer than the grouped
+    # branch can take is consumed in bites rather than not at all (with a guard,
+    # "GB12GB12..." verification failed closed).
+    # Case-insensitive ("gb82 west ..." is the same IBAN, and an upper-case-only shape
+    # leaked it). No left boundary at all, so "a@a.testGB68..." and "...0100GB00 0AAA..."
+    # still yield an IBAN match. The cost is over-redaction of long codes that contain two
     # letters followed by two digits (hex hashes, SKUs) -- the safe direction.
     "iban": re.compile(
         r"[A-Z]{2}\d{2}"
-        r"(?:[A-Z0-9]{11,128}|(?: [A-Z0-9]{4}){2,7}(?: [A-Z0-9]{1,4})?(?![A-Z0-9]))",
+        rf"(?:(?:{_GAP}[A-Z0-9]{{4}}){{2,31}}(?:{_GAP}[A-Z0-9]{{1,4}})?(?![A-Z0-9])"
+        r"|[A-Z0-9]{11,128})",
         re.IGNORECASE,
     ),
     # Optional "+CC", then "(ddd)" or "ddd", then ddd and dddd, each gap independent.
@@ -117,18 +124,21 @@ _DETECTORS: dict[str, re.Pattern[str]] = {
 _DIGIT_KINDS = frozenset({"phone", "digit_run", "card", "tax_id", "routing", "account"})
 
 # Detectors scanned for OVERLAPPING matches (a match may start inside another match of
-# the same detector). A compact IBAN's [A-Z0-9] run swallows the start of an IBAN glued
-# after it ("...AAAA000000000GB00 ZDPK ..."), and a non-overlapping scan resumes only
-# after the first match, orphaning the second IBAN's groups. Bounded patterns only:
-# the cost is one attempt per start position, at most 128 characters each.
+# the same detector). IBANs glued together at different 4-alignments
+# ("GB000000AAAAAAAAAAGB00 00AA 0AAA ...") are not one run of groups: a non-overlapping
+# scan resumes after the first match and strands the second IBAN's groups. Removing this
+# scan was tried in round 3 and re-opened exactly that leak, so it stays -- at a declared
+# cost: an inner match at another alignment can absorb a following 1-4 character word
+# ("ST12345698765432 now" inside "GB82WEST12345698765432 now"), widening the span into a
+# merged span whose surrogate is context-specific. That loses a join; it never leaks and
+# never makes a false join. Bounded patterns only: one attempt per start position.
 _OVERLAPPING: dict[str, re.Pattern[str]] = {
     kind: re.compile(rf"(?=({_DETECTORS[kind].pattern}))", _DETECTORS[kind].flags)
     for kind in ("iban",)
 }
 
-# Substitution can expose a new match (a surrogate's ']' newly satisfies the IBAN's
-# "not after an upper-case letter" lookbehind), so detect+substitute repeats until
-# nothing more is found.
+# Substitution can expose a new match (a surrogate's ']' ends a run that a neighbour's
+# guard refused to end), so detect+substitute repeats until nothing more is found.
 _MAX_PASSES = 4
 
 # Test seam. A kind set here is MISSED: no span overlapping one of its matches is
@@ -173,54 +183,69 @@ _ALSO_INVISIBLE = (0x2800, 0x3164, 0x1160, 0x115F, 0xFFA0)
 _INVISIBLE: frozenset[int] = frozenset(
     {cp for lo, hi in _DEFAULT_IGNORABLE for cp in range(lo, hi + 1)} | set(_ALSO_INVISIBLE)
 )
-# A combining mark (Mn/Me) directly after one of these is dropped: it can only be there to
-# break a digit run ("021<U+0301>000021"), and it carries no meaning on a digit.
-_DIGIT_OR_GAP = frozenset("0123456789 \t\r\n./-")
+# The only control characters kept: the whitespace ones, which are gap characters.
+# Every other C0/C1 control (NUL, BS, ESC, DEL, NEL, ...) split a digit run.
+_KEPT_CONTROLS = frozenset("\t\n\r\x0b\x0c")
 
 
 def _normalise(text: str) -> str:
-    """NFKC (full-width digits -> ASCII), every Unicode space -> ' ', every dash and the
-    minus sign -> '-', format characters (Cf) and other invisible characters removed, and
-    combining marks after a digit or separator removed.
+    """Structural, not per-character. After NFKD (compatibility DEcomposition, so every
+    precomposed letter splits into base + combining mark):
+
+    - every decimal digit of any script (Nd) -> its ASCII digit;
+    - REMOVED from all text: every combining mark (Mn, Me) -- i.e. every diacritic, so
+      "cafe\\u0301" and "caf\\u00e9" both become "cafe" -- every control character except
+      TAB/LF/CR/VT/FF, every format character (Cf), every Default_Ignorable_Code_Point,
+      and the blank-rendering characters above;
+    - every Unicode space (Zs) -> ' '; every dash (Pd) and the minus sign -> '-';
+    - then NFC, which only recomposes what is left (Hangul syllables).
+
+    Decomposing first is what makes the mark rule structural: under NFKC, "e" + U+0301
+    composes to "e-acute" (a letter, Ll), survives a strip of Mn, and breaks the
+    `[A-Za-z]` TLD of "ana@x.te\\u0301st" -- a leak with verified=True.
 
     The redacted OUTPUT is this normalised text -- including the text around identifiers,
-    so ligatures, superscripts, full-width forms, bidi marks and ZWJ in emoji are
-    normalised too. No offset map back into the original is provided.
+    so ligatures, superscripts, full-width forms, diacritics, bidi marks and ZWJ in emoji
+    are normalised too. No offset map back into the original is provided.
     """
     out: list[str] = []
-    for ch in unicodedata.normalize("NFKC", text):
+    for ch in unicodedata.normalize("NFKD", text):
         category = unicodedata.category(ch)
-        if category == "Cf" or ord(ch) in _INVISIBLE:
+        if category in ("Cf", "Mn", "Me") or ord(ch) in _INVISIBLE:
             continue
-        if category in ("Mn", "Me") and out and out[-1] in _DIGIT_OR_GAP:
+        if category == "Cc" and ch not in _KEPT_CONTROLS:
             continue
-        if category == "Zs":
+        if category == "Nd":
+            out.append(str(unicodedata.decimal(ch)))
+        elif category == "Zs":
             out.append(" ")
         elif category == "Pd" or ch == _MINUS_SIGN:
             out.append("-")
         else:
             out.append(ch)
-    return "".join(out)
+    return unicodedata.normalize("NFC", "".join(out))
 
 
 def _canonical(kind: str, identifier: str) -> str:
     """The HMAC input: one identifier gets one surrogate whatever its layout or case.
 
-    Digit kinds -> the digits alone; IBAN -> separator-free upper case; email (and any
-    merged span labelled email) -> lower case.
+    Digit kinds -> the digits alone; IBAN -> its letters and digits, upper case; email ->
+    lower case.
     """
     if kind in _DIGIT_KINDS:
         return "".join(ch for ch in identifier if ch.isdigit())
     if kind == "iban":
-        return "".join(identifier.split()).upper()
+        return "".join(ch for ch in identifier if ch.isalnum()).upper()
     return identifier.lower()
 
 
-def _merged_spans(text: str) -> list[tuple[int, int, str]]:
+def _merged_spans(text: str) -> list[tuple[int, int, str, bool]]:
     """Every detector's matches over the same text; overlapping matches merged.
 
     Each merged span is labelled by its longest constituent match (earlier detector on a
-    tie), so an IBAN containing a phone-shaped tail is one IBAN, not a residue.
+    tie), so an IBAN containing a phone-shaped tail is one IBAN, not a residue. The flag
+    is True when that labelling match covers the WHOLE span (a standalone identifier) and
+    False when other matches widened it (a merged span) -- see _hmac_input.
     """
     found: list[tuple[int, int, int, str]] = []
     for rank, (kind, pattern) in enumerate(_DETECTORS.items()):
@@ -231,20 +256,25 @@ def _merged_spans(text: str) -> list[tuple[int, int, str]]:
             found.extend((m.start(), m.end(), rank, kind) for m in pattern.finditer(text))
     found.sort()
 
-    merged: list[tuple[int, int, str, bool]] = []  # (start, end, label, missed)
+    # (start, end, label, missed, label_start, label_end)
+    merged: list[tuple[int, int, str, bool, int, int]] = []
     best: tuple[int, int] = (0, 0)  # (length, -rank) of the current span's label
     for start, end, rank, kind in found:
         score = (end - start, -rank)
         missed = bool(_SUBSTITUTION_DISABLED.get(kind))
         if merged and start < merged[-1][1]:
-            m_start, m_end, m_kind, m_missed = merged[-1]
+            m_start, m_end, m_kind, m_missed, l_start, l_end = merged[-1]
             if score > best:
-                best, m_kind = score, kind
-            merged[-1] = (m_start, max(m_end, end), m_kind, m_missed or missed)
+                best, m_kind, l_start, l_end = score, kind, start, end
+            merged[-1] = (m_start, max(m_end, end), m_kind, m_missed or missed, l_start, l_end)
         else:
             best = score
-            merged.append((start, end, kind, missed))
-    return [(start, end, kind) for start, end, kind, missed in merged if not missed]
+            merged.append((start, end, kind, missed, start, end))
+    return [
+        (start, end, kind, (l_start, l_end) == (start, end))
+        for start, end, kind, missed, l_start, l_end in merged
+        if not missed
+    ]
 
 
 class RedactionResult(BaseModel):
@@ -275,11 +305,17 @@ class RedactionResult(BaseModel):
         return Labelled(self.text, Sensitivity.REDACTED)
 
 
-def _surrogate(kind: str, original: str, key: bytes) -> str:
-    """Keyed on the CANONICAL identifier. A merged span (two identifiers glued together)
-    is canonicalised as one string, so its surrogate is not either standalone one's."""
-    canonical = _canonical(kind, original)
-    digest = hmac.new(key, f"{kind}:{canonical}".encode(), sha256).hexdigest()[:12]
+def _hmac_input(kind: str, original: str, *, standalone: bool = True) -> str:
+    """A standalone identifier is keyed on its CANONICAL form, so it shares a surrogate
+    across layouts and case. A MERGED span is keyed on its full normalised text: a
+    canonical form drops parts (digits-only kept "4111 1111 1111 1111" and lost "a@b.cc"),
+    which gave a glued span the standalone card's surrogate -- a false join."""
+    return _canonical(kind, original) if standalone else original
+
+
+def _surrogate(kind: str, original: str, key: bytes, *, standalone: bool = True) -> str:
+    material = _hmac_input(kind, original, standalone=standalone)
+    digest = hmac.new(key, f"{kind}:{material}".encode(), sha256).hexdigest()[:12]
     return f"[{kind.upper()}:{digest.translate(_HEX_TO_LETTERS)}]"
 
 
@@ -304,10 +340,11 @@ def redact(payload: Labelled[str], *, key: bytes) -> RedactionResult:
             break
         parts: list[str] = []
         cursor = 0
-        for start, end, kind in spans:
+        for start, end, kind, standalone in spans:
             original = text[start:end]
-            seen.setdefault(kind, set()).add(_canonical(kind, original))
-            parts += [text[cursor:start], _surrogate(kind, original, key)]
+            seen.setdefault(kind, set()).add(_hmac_input(kind, original, standalone=standalone))
+            surrogate = _surrogate(kind, original, key, standalone=standalone)
+            parts += [text[cursor:start], surrogate]
             cursor = end
         text = "".join([*parts, text[cursor:]])
 

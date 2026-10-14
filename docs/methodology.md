@@ -12,62 +12,93 @@ that every kind named there is also named here.
 
 | `00` §4.2 class | Status | Detector kind(s) | Shapes recognised (after normalisation, below) |
 |---|---|---|---|
-| Emails | Covered | `email` | `local@domain.tld`; local part 0–64 chars of `[\w.%+-]`, so a bare `@domain.tld` residue is also redacted |
+| Emails | Covered (ASCII TLD) | `email` | `local@domain.tld`; local part 0–64 chars of `[\w.%+-]`, so a bare `@domain.tld` residue is also redacted; the TLD must be ASCII letters |
 | Phones | Covered (NANP shape) | `phone` | optional `+CC` (1–3 digits) prefix; `(ddd)` or `ddd`; then `ddd` and `dddd`, each gap independent (`555-010-0100`, `555 010-0100`, `555/010.0100`, `5550100100`) |
 | Tax ids | Covered (US shapes only) | `tax_id` | EIN `12-3456789`; SSN/ITIN `123-45-6789` (hyphenated; other layouts are still caught as digit runs) |
-| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or spaced in groups of four with single spaces `GB82 WEST 1234 5698 7654 32` (`iban`) |
+| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or in groups of four with the same gap before every group, the trailing 1–4 character group included (`GB82 WEST 1234 5698 7654 32`, `GB82-WEST-1234-5698-7654-32`, `MT84  MALT  0110  0001  2345  MTLC  AST0  01S`, `GB82WEST 1234 ...`) (`iban`) |
 | Addresses | **NOT covered** | `address` (declared, no detector) | — |
 | Person names | **NOT covered** | `person_name` (declared, no detector) | — |
 
 **Every run of 8 or more digits is redacted**, however it is split by the gaps below and
-whatever its length: 8–12 (`account`, or `routing`/`phone`/`tax_id` on a tie), 13–19
-(`card`), 20+ (`digit_run`).
+whatever its length or script: 8–12 (`account`, or `routing`/`phone`/`tax_id` on a tie),
+13–19 (`card`), 20+ (`digit_run`).
 
-### Normalisation — which separators are covered
+### Normalisation — structural, applied to ALL text
 
 Before detection the text is normalised, and **the redacted output is the normalised
 text — all of it, not only the identifiers** (see "Output text" below):
 
-1. Unicode NFKC (full-width digits `０-９` become ASCII digits; compatibility forms fold).
-2. Every space separator (category `Zs`: NBSP U+00A0, narrow NBSP U+202F, thin space
-   U+2009, en space U+2002, ...) becomes an ASCII space.
-3. Every dash (category `Pd`: en dash U+2013, em dash U+2014, non-breaking hyphen U+2011,
-   ...) and the minus sign U+2212 becomes an ASCII hyphen.
-4. Removed: every format character (category `Cf`: zero-width space, soft hyphen, word
-   joiner, bidi marks, ZWJ/ZWNJ, BOM, tag characters, ...); every
-   `Default_Ignorable_Code_Point` (hard-coded from Unicode 15.0.0, the version Python
-   3.12 implements — includes the combining grapheme joiner U+034F, variation selectors
-   U+FE00–FE0F and U+E0100–E01EF, Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer
-   U+17B4/17B5, Mongolian U+180B–180F); the braille pattern blank U+2800; and any
-   combining mark (`Mn`/`Me`) directly after a digit or a gap character.
+1. Unicode **NFKD** (compatibility decomposition: full-width and mathematical digits fold
+   to ASCII, ligatures split, and every precomposed letter splits into base letter plus
+   combining mark).
+2. Every decimal digit of **any** script (category `Nd`: Arabic-Indic `٠-٩`, Devanagari
+   `०-९`, Thai, Bengali, Adlam, ... — every `Nd` Python 3.12 knows) becomes its ASCII
+   digit.
+3. **Removed:**
+   - every combining mark (`Mn`, `Me`). Because step 1 decomposed first, this removes
+     **every diacritic from all text**: `café` becomes `cafe`, `ana@x.tést`
+     becomes `ana@x.test`, and Devanagari vowel signs and nukta are dropped;
+   - every control character (`Cc`) except TAB, LF, CR, VT and FF: NUL, BS, ESC, DEL, NEL
+     and the rest of C0/C1;
+   - every format character (`Cf`: zero-width space, soft hyphen, word joiner, bidi marks,
+     ZWJ/ZWNJ, BOM, tag characters, ...);
+   - every `Default_Ignorable_Code_Point`, hard-coded from Unicode 15.0.0 (the version
+     Python 3.12 implements). This includes CGJ U+034F, the variation selectors, the
+     Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer U+17B4/17B5 and Mongolian
+     U+180B–180F;
+   - the braille pattern blank U+2800.
+4. Every space separator (`Zs`) becomes an ASCII space. Every dash (`Pd`) and the minus
+   sign U+2212 becomes an ASCII hyphen.
+5. NFC, which only recomposes what is left (Hangul syllables).
 
-After that, the gap the digit detectors (`phone`, `account`, `card`, `digit_run`) accept
-**between two digits** is nothing, or a run of **1 to 3** characters from: space, TAB,
-CR, LF (and other whitespace), `.`, `-`, `/`. So `4111  1111`, `4111<TAB>1111` (the
-innerText of a table row), `4111<LF>1111`, `4111 - 1111` and `4111/1111` are one run. A
-gap of 4 or more such characters, or any other character (`,`, `:`, a letter), ends the
-run — and a run that ends with fewer than 8 digits is not redacted. IBANs are recognised
-compact or with single spaces between groups of four.
+After that, the **gap** the digit detectors (`phone`, `account`, `card`, `digit_run`) and
+the IBAN groups accept is nothing, or a run of **1 to 3** characters from: whitespace
+(space, TAB, CR, LF, VT, FF), `.`, `-`, `/`. So `4111  1111`, `4111<TAB>1111` (the
+innerText of a table row), `4111<LF>1111`, `4111 - 1111` and `4111/1111` each form one
+run.
+
+**Not covered — each of these ENDS a run**, and a run that ends with fewer than 8 digits
+is not redacted:
+- the separators `,` `'` `:` `|` `_` `;` `·` (U+00B7) `•` (U+2022), the Arabic decimal
+  separator U+066B and the Arabic thousands separator U+066C, and any other character
+  outside the gap set, letters included (`1234,5678` and `1234_5678` are NOT redacted);
+- gaps of 4 or more gap characters (`4111    1111`).
 
 ### Surrogates and joins
 
-The HMAC input is the **canonical** identifier, so one identifier gets one surrogate
-whatever its layout or case: digits only for `phone`, `account`, `routing`, `card`,
-`tax_id`, `digit_run` (`555-010-0100` and `(555) 010 0100` match); separator-free upper
-case for `iban` (spaced and compact match); lower case for `email` (`ana@x.test` and
-`ANA@X.TEST` match). Joins across documents survive that far. They do NOT survive
-merging: when identifiers are glued together (or overlap) they are replaced as **one
-merged span with one surrogate, which is not the surrogate either identifier gets on its
-own**. The label also differs between kinds: the same digits labelled `phone` in one
-document and `account` in another get different surrogates.
+The HMAC input of a **standalone** identifier is its **canonical** form, so one identifier
+gets one surrogate whatever its layout or case. A span is standalone when the detector
+match that labels it covers the whole span. The canonical forms are:
+- the digits alone for `phone`, `account`, `routing`, `card`, `tax_id` and `digit_run`
+  (`555-010-0100` and `(555) 010 0100` match);
+- the letters and digits in upper case for `iban` (compact, spaced, dashed and
+  lower-case layouts match);
+- lower case for `email` (`ana@x.test` and `ANA@X.TEST` match).
+
+A **merged** span is one where identifiers were glued together, or overlapping matches
+widened the span beyond its labelling match. Its HMAC input is the kind plus the
+**full normalised span text**, never a canonical form that drops parts. Its surrogate
+is therefore **not** the surrogate of any identifier inside it. For example,
+`4111 1111 1111 1111a@b.cc` does not get the standalone card's surrogate.
+
+Joins break in two other cases as well:
+- **Different labels:** the same digits get different surrogates when the label differs
+  (`phone` standing alone, `card` when glued to more digits).
+- **Different country prefix:** `+1 555 010 0100` and `555-010-0100` canonicalise to
+  different digits. This is deferred, not fixed.
 
 ### Output text
 
-The redacted text is the normalised text. Non-identifier text is therefore changed too:
-ligatures (`ﬁ` → `fi`), superscripts (`²` → `2`), full-width letters, compatibility
-forms, bidi marks and ZWJ inside emoji sequences are all normalised or removed. **No
-offset map from the output back into the original is provided**; a consumer that needs
-to align the two must normalise the original with the same rules.
+The redacted text is the normalised text, so text outside the identifiers changes too:
+- diacritics are removed from all text;
+- control characters other than TAB/LF/CR/VT/FF are removed;
+- ligatures are split (`ﬁ` → `fi`) and superscripts flattened (`²` → `2`);
+- full-width letters and other compatibility forms are folded;
+- digits of every script become ASCII;
+- bidi marks and ZWJ inside emoji sequences are removed.
+
+**No offset map from the output back into the original is provided.** A consumer that
+needs to align the two must normalise the original with the same rules (`_normalise`).
 
 ### What "not covered" means operationally
 
@@ -79,26 +110,44 @@ document containing a person's name or a street address is not `REDACTED` — it
 
 ### Known gaps inside the covered classes
 
-- Account numbers shorter than 8 digits are not detected, nor are digit groups separated
-  by a gap of 4+ characters or by anything outside the gap set (e.g. `1234,5678`).
-- Non-US tax ids and non-NANP phone layouts are not detected as such (8+ digits of them
-  are still caught as digit runs).
+- Account numbers shorter than 8 digits are not detected. Neither are digit groups split
+  by a separator outside the gap set or by a gap of 4+ characters (the "Not covered" list
+  above).
+- **Emails with an IDN or non-ASCII TLD** (`user@example.рф`, `user@例え.テスト`) are not
+  detected. Neither are local parts that use characters outside `[\w.%+-]`.
+- Non-US tax ids and non-NANP phone layouts are not detected as such, although their
+  8+-digit runs are still caught as digit runs.
 
 ### Over-redaction (declared, deliberate)
 
-The bias is toward over-redaction. These shapes are redacted although they are usually
-not identifiers, and that reduces the usefulness of heal-log evidence:
+The bias is toward over-redaction. The shapes below are redacted even though they are
+usually not identifiers, which reduces the usefulness of heal-log evidence:
 
-- any 8+ digits joined by the gap set: dates (`2026-10-14`, `2026/10/14`, `20261014`),
-  IP addresses (`192.168.100.200`), version strings, order numbers;
-- rows of small numbers and prices in tab-separated or spaced tables (`1<TAB>2<TAB>3 ...`
-  with 8+ digits in total, `12.50 13.75 9.99`) become `account`, `card` or `digit_run`;
-- any token of 15+ letters/digits starting with two letters and two digits, in either
-  case (hex hashes, SKUs), as `iban`; and, after an IBAN-like prefix, up to seven
-  space-separated 4-character words of either case plus one final 1–4 character word
-  (`AB12 THIS WORD ok` is redacted whole, `ok` included);
-- identifiers glued together with no separator are redacted (no fragment of either
-  survives — property-tested) but merge into one surrogate under one label.
+- **Any 8+ digits joined by the gap set:** dates (`2026-10-14`, `2026/10/14`,
+  `20261014`), IP addresses (`192.168.100.200`), version strings, order numbers.
+- **Rows of small numbers and prices** in tab-separated or spaced tables become
+  `account`, `card` or `digit_run`: `1<TAB>2<TAB>3 ...` once it reaches 8+ digits in
+  total, or `12.50 13.75 9.99`.
+- **IBAN-shaped tokens and the words after them:** any token of 15+ letters/digits that
+  starts with two letters and two digits, in either case (hex hashes, SKUs), is
+  redacted as `iban`. After an IBAN-like prefix, the redaction also takes up to seven
+  4-character words of either case joined by any gap, plus one final word of 1–4
+  characters. So `AB12 THIS WORD ok` is redacted whole, `ok` included. An IBAN can
+  absorb a short word (1–4 characters) that follows it in two ways:
+  - Its own last group has four characters: `GB82 WEST 1234 5698 7654 3210 and` loses
+    `and`.
+  - An inner IBAN-shaped match at another 4-alignment ends there. The scan must look for
+    overlapping IBAN matches, or IBANs glued together leak. For example
+    `GB82WEST12345698765432 now` contains `ST12345698765432 now`.
+
+  In the second case, and whenever an inner match widens the span, the span becomes a
+  **merged span** keyed on its full text. So **the IBAN's surrogate in that context is
+  not its standalone surrogate**: the join is lost, but nothing leaks and there is no
+  false join. Followed by `;`, `,`, `)` or end of text, an IBAN keeps its standalone
+  (canonical) surrogate.
+- **Glued identifiers:** identifiers glued together with no separator are redacted (no
+  fragment of either survives, property-tested), but they merge into one span with one
+  surrogate.
 
 ### How redaction works, and what verification can and cannot catch
 

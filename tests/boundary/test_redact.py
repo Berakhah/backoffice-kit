@@ -1,5 +1,6 @@
 import re
 import time
+import unicodedata
 from collections import Counter
 from pathlib import Path
 
@@ -331,6 +332,144 @@ def test_one_identifier_shares_a_surrogate_across_layouts_and_case(one: str, two
     assert a.text == b.text
 
 
+# --- Fix round 3 ------------------------------------------------------------------------
+
+_KEPT_CONTROLS = "\t\n\r\x0b\x0c"
+_PLAIN_ROUTING = "routing 021000021 end"
+
+
+@pytest.mark.parametrize(
+    "cp", [cp for cp in (*range(0x00, 0x20), *range(0x7F, 0xA0)) if chr(cp) not in _KEPT_CONTROLS]
+)
+def test_every_control_character_between_digits_is_stripped(cp: int) -> None:
+    """All of C0/C1 (DEL and NEL included) except the five whitespace controls: each one
+    split '021000021' invisibly and passed with verified=True."""
+    c = chr(cp)
+    r = redact(_cc(f"routing 021{c}000{c}021 end"), key=KEY)
+    assert r.verified is True
+    assert r.text == redact(_cc(_PLAIN_ROUTING), key=KEY).text
+
+
+def _all_digit_zeros() -> list[int]:
+    """The zero of every decimal-digit script Python knows (Nd with value 0)."""
+    return [
+        cp
+        for cp in range(0x110000)
+        if unicodedata.category(chr(cp)) == "Nd" and unicodedata.decimal(chr(cp)) == 0
+    ]
+
+
+def test_every_decimal_digit_script_is_redacted_even_with_marks_after_digits() -> None:
+    """All Nd digits fold to ASCII, and a combining mark after any of them is stripped:
+    Arabic-Indic '021' + U+0301 + '000' ... and its 650-digit siblings leaked."""
+    plain = redact(_cc(_PLAIN_ROUTING), key=KEY).text
+    zeros = _all_digit_zeros()
+    assert len(zeros) >= 60
+    for zero in zeros:
+        digits = [chr(zero + d) for d in (0, 2, 1, 0, 0, 0, 0, 2, 1)]
+        bare = "".join(digits)
+        marked = "".join(d + "\u0301" for d in digits)
+        for variant in (bare, marked):
+            r = redact(_cc(f"routing {variant} end"), key=KEY)
+            assert r.verified is True, hex(zero)
+            assert r.text == plain, hex(zero)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "021\u2003\u0301000\u2003\u0301021",  # mark after non-ASCII whitespace
+        "021 \u0301000 \u0301021",  # mark after ASCII space
+        "021\x0b\u0301000\x0b\u0301021",  # mark after vertical tab
+        "\u0662\u0660\u0661\u0301\u0660\u0660\u0660\u0301\u0660\u0662\u0661",
+        "\u0966\u0968\u0967\u093c\u0966\u0966\u0966\u093c\u0966\u0968\u0967",
+    ],
+)
+def test_marks_after_any_digit_or_gap_are_stripped(variant: str) -> None:
+    r = redact(_cc(f"ref {variant} end"), key=KEY)
+    assert r.verified is True
+    assert sum(r.surrogate_count.values()) == 1
+    assert not re.search(r"\d", _leftover(r.text))
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "GB82-WEST-1234-5698-7654-32",  # was "GB82-WEST-[CARD]"
+        "GB82.WEST.1234.5698.7654.32",
+        "GB82/WEST/1234/5698/7654/32",
+        "GB82\tWEST\t1234\t5698\t7654\t32",
+        "GB82  WEST  1234  5698  7654  32",
+        "gb82-west-1234-5698-7654-32",
+        "GB82WEST 1234 5698 7654 32",
+        "GB82 - WEST - 1234 - 5698 - 7654 - 32",
+    ],
+)
+def test_an_iban_in_any_covered_layout_is_one_iban(layout: str) -> None:
+    # ";" after the IBAN: a following 1-4 character word may be absorbed (declared, see
+    # test_an_iban_followed_by_a_short_word_loses_its_join_but_never_leaks).
+    compact = redact(_cc("pay GB82WEST12345698765432; now"), key=KEY)
+    r = redact(_cc(f"pay {layout}; now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"iban": 1}
+    assert r.text == compact.text  # one surrogate across layouts and case
+
+
+def test_an_iban_with_letters_in_its_trailing_groups_leaves_nothing() -> None:
+    """'MTLC  AST0  01S' survived when only single spaces joined groups."""
+    iban = "MT84  MALT  0110  0001  2345  MTLC  AST0  01S"
+    r = redact(_cc(f"pay {iban} now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"iban": 1}
+    assert not _fragments(iban) & _fragments(_leftover(r.text))
+    for group in ("MTLC", "AST0", "01S"):
+        assert group not in r.text
+
+
+@pytest.mark.parametrize(
+    "email", ["ana@\u0301x.test", "ana@x\u0301.test", "ana@x.t\u0301est", "a\u20ddna@x.test"]
+)
+def test_combining_marks_inside_an_email_do_not_defeat_detection(email: str) -> None:
+    plain = redact(_cc("mail ana@x.test now"), key=KEY)
+    r = redact(_cc(f"mail {email} now"), key=KEY)
+    assert r.verified is True
+    assert r.text == plain.text
+
+
+def test_an_iban_absorbs_a_short_following_word_and_redacts_it() -> None:
+    """Declared over-redaction: the trailing group of an IBAN may be letters (Seychelles
+    ends in 'USD', Malta in '01S'), so a 1-4 character word after an IBAN is taken too.
+    Safe for the boundary; the cost is a different surrogate in that context."""
+    r = redact(_cc("SC52 BAHL 0103 1234 5678 9012 3456 USD and more"), key=KEY)
+    assert r.verified is True
+    assert "USD" not in r.text
+    assert "BAHL" not in r.text
+    assert r.text.endswith(" more")
+
+
+def test_an_iban_followed_by_a_short_word_loses_its_join_but_never_leaks() -> None:
+    """Declared trade-off. The overlapping IBAN scan (needed for IBANs glued at another
+    4-alignment) finds 'ST12345698765432 now' inside 'GB82WEST12345698765432 now'; the
+    span widens to a merged span, keyed on its full text. The word is redacted, the IBAN
+    is redacted, and the surrogate differs from the IBAN's standalone one."""
+    standalone = redact(_cc("GB82WEST12345698765432;"), key=KEY)
+    absorbed = redact(_cc("GB82WEST12345698765432 now;"), key=KEY)
+    assert absorbed.verified is True
+    assert absorbed.surrogate_count == {"iban": 1}
+    assert "now" not in absorbed.text
+    assert absorbed.text != standalone.text
+
+
+def test_a_merged_span_does_not_share_the_standalone_identifiers_surrogate() -> None:
+    """'4111 1111 1111 1111a@b.cc' merged into one span labelled card; its canonical form
+    kept only the digits, so it got the standalone card's surrogate -- a false join."""
+    standalone = redact(_cc("4111 1111 1111 1111"), key=KEY)
+    merged = redact(_cc("4111 1111 1111 1111a@b.cc"), key=KEY)
+    assert merged.verified is True
+    assert "a@b.cc" not in merged.text
+    assert merged.text != standalone.text
+
+
 # --- Properties -------------------------------------------------------------------------
 
 _SEP = st.sampled_from([" ", "-", ".", "", "\t", "\n", "  ", " - ", "/", "\r\n"])
@@ -352,6 +491,21 @@ def _card(draw: st.DrawFn) -> str:
     return "".join(g + draw(_SEP) for g in groups[:-1]) + groups[-1]
 
 
+_IBAN_GAP = st.sampled_from([" ", "", "-", ".", "/", "\t", "  ", " - ", "\n"])
+
+
+@st.composite
+def _iban(draw: st.DrawFn) -> str:
+    """Every covered layout: compact, or groups of four joined by any covered gap (the
+    gaps independent), either case, with a trailing group of 1-4 that may hold letters."""
+    groups = [draw(st.from_regex(r"[A-Za-z0-9]{4}", fullmatch=True)) for _ in range(4)]
+    tail = draw(st.from_regex(r"[A-Za-z0-9]{1,4}", fullmatch=True))
+    cc = draw(st.sampled_from(["GB", "gb", "MT", "Nl"]))
+    check = draw(st.from_regex(r"[0-9]{2}", fullmatch=True))
+    body = "".join(draw(_IBAN_GAP) + g for g in [*groups, tail])
+    return f"{cc}{check}{body}"
+
+
 _TAGGED = st.one_of(
     st.tuples(st.just("email"), st.from_regex(r"[a-z]{1,8}@[a-z]{1,8}\.test", fullmatch=True)),
     st.tuples(st.just("phone"), _phone()),
@@ -359,6 +513,7 @@ _TAGGED = st.one_of(
     st.tuples(
         st.just("iban"), st.from_regex(r"GB[0-9]{2}( [A-Z0-9]{4}){4} [0-9]{2}", fullmatch=True)
     ),
+    st.tuples(st.just("iban"), _iban()),
     st.tuples(st.just("card"), _card()),
     st.tuples(st.just("routing"), st.from_regex(r"[0-9]{9}", fullmatch=True)),
     st.tuples(st.just("tax_id"), st.from_regex(r"[0-9]{2}-[0-9]{7}", fullmatch=True)),
@@ -372,19 +527,36 @@ def _noisy(draw: st.DrawFn, tagged: tuple[str, str]) -> tuple[str, str]:
     """Swap ASCII separators for Unicode look-alikes, sprinkle format characters between
     digits, and sometimes widen digits -- what DOM text and copy-paste actually carry."""
     kind, value = tagged
+    zero = draw(st.sampled_from(_DIGIT_ZEROS))  # one script per identifier, sometimes
     out: list[str] = []
     for ch in value:
         if ch == " ":
             out.append(draw(st.sampled_from([" ", "\u00a0", "\u202f", "\u2009"])))
         elif ch == "-":
             out.append(draw(st.sampled_from(["-", "\u2013", "\u2014", "\u2212", "\u2011"])))
-        elif ch.isdigit() and draw(st.integers(0, 7)) == 0:
-            out.append(chr(ord(ch) - 0x30 + 0xFF10))
+        elif ch.isdigit() and draw(st.integers(0, 3)) == 0:
+            out.append(chr(zero + int(ch)))
         else:
             out.append(ch)
         if ch.isdigit():
             out.append(draw(st.sampled_from(_BETWEEN_DIGITS)))
+        elif kind == "email" and draw(st.integers(0, 5)) == 0:
+            out.append(draw(st.sampled_from(["\u0301", "\u0308", "\u20dd", "\u200d"])))
     return kind, "".join(out)
+
+
+_DIGIT_ZEROS = [
+    0x0030,  # ASCII
+    0xFF10,  # full-width
+    0x0660,  # Arabic-Indic
+    0x06F0,  # extended Arabic-Indic
+    0x0966,  # Devanagari
+    0x09E6,  # Bengali
+    0x0E50,  # Thai
+    0x1040,  # Myanmar
+    0x1D7CE,  # mathematical bold
+    0x1E950,  # Adlam
+]
 
 
 _BETWEEN_DIGITS = [
@@ -398,7 +570,15 @@ _BETWEEN_DIGITS = [
     "\u3164",  # hangul filler
     "\uffa0",  # halfwidth hangul filler
     "\u0301",  # combining acute accent
+    "\u093c",  # devanagari nukta (Mn) -- after a non-ASCII digit too
+    "\u20e3",  # combining enclosing keycap (Me)
     "\U000e0041",  # tag character
+    "\x00",  # C0 controls
+    "\x08",
+    "\x1b",
+    "\x7f",  # DEL
+    "\x85",  # NEL (C1)
+    "\x9f",  # C1
 ]
 
 
@@ -422,8 +602,13 @@ def test_separated_identifiers_are_each_redacted_whole_and_classified(
     tagged: list[tuple[str, str]],
 ) -> None:
     """Per-kind counts catch a split or a misclassification that a bare 'verified' and
-    'original absent' assertion cannot see: NL91ABNA[PHONE:..] passed both."""
-    doc = "<< " + " and ".join(v for _, v in tagged) + " >>"
+    'original absent' assertion cannot see: NL91ABNA[PHONE:..] passed both.
+
+    The joiner is " ; " because an IBAN absorbs a following word of 1-4 letters/digits
+    (its trailing group may be letters), and absorbing " and" widens the span into a
+    merged span with its own surrogate -- declared, and pinned separately by
+    test_an_iban_absorbs_a_short_following_word_and_redacts_it."""
+    doc = "<< " + " ; ".join(v for _, v in tagged) + " >>"
     _assert_redacted(doc, tagged, exact_kinds=True)
 
 
