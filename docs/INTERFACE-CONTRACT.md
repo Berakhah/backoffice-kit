@@ -191,10 +191,30 @@ As of 0.2.5 (supersedes the normalisation bullet of 0.2.3):
   4-alignment leak. As a result an IBAN followed by a 1–4 character word can absorb it (e.g.
   `…765432 now`). The span is then merged and its surrogate is context-specific: the join is
   lost, but nothing leaks and there is no false join.
-- Declared NOT covered:
+- Declared NOT covered *(superseded by the canonical 0.2.6 list below)*:
   - groups separated by `,` `'` `:` `|` `_` `;` `·` `•`, U+066B or U+066C;
   - gaps of 4+ characters;
   - emails with an IDN or non-ASCII TLD.
+
+As of 0.2.6 (Task 8b hardening):
+- IBAN national display formats: a supplementary pattern of the same kind matches an
+  optional gap between country code and check digits (upper-case code when gapped),
+  then 11–30 letters/digits in gap-separated groups of any width.
+- Email local parts follow RFC 5322: full atext, quoted strings, comments, and Unicode
+  letters including `Mc`.
+- Lookalike slashes, full stops and dash-likes are mapped into the gap set.
+- `Cs`, `Co` and `Cn` are removed, so `text` never carries a lone surrogate.
+- **Declared gaps** — the canonical list. `docs/methodology.md` carries the identical
+  list, and a test asserts that they match:
+
+<!-- declared-gaps:start -->
+- Addresses and person names: no detector yet (a local NER model is planned for week 5).
+- Digit groups split by `,` `'` `:` `|` `_` `;`, U+066B or U+066C, or by any other character outside the gap set and its mapped lookalikes. Box-drawing verticals and corners, and dingbat slashes and dashes not in `_LOOKALIKE`, are not mapped.
+- Gaps of 4 or more gap characters between digit groups.
+- Account numbers shorter than 8 digits. Non-US tax ids and non-NANP phone layouts are not detected as such, though their runs of 8+ digits are still caught.
+- Emails with an IDN or non-ASCII TLD, emails with comments or quoted strings in the domain part, and local parts of more than 64 items or starting more than 256 characters before the `@`.
+- Digit-valued `No` characters without an NFKD digit form: dingbat negative-circled digits (U+2776-U+277F), double-circled digits (U+24F5-U+24FE), Ethiopic (U+1369-U+137C), Kharoshthi (U+10A40-U+10A48), Brahmi (U+11052-U+11065), Rumi (U+10E60-U+10E7E), and similar.
+<!-- declared-gaps:end -->
 
 **Detector coverage is a declared list, not an implied one.** `00` §4.2 names emails, phones, tax
 ids, bank/routing numbers, addresses and person names. Whatever ships in v0.1 of the package,
@@ -849,6 +869,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.6 | 2026-10-14 | **§1.3 `redact` — Task 8b hardening. No symbol changes; detection widened.** (1) A supplementary `iban` pattern for national display formats (groups of any width, an optional gap after an upper-case country code, 11–30 BBAN letters/digits). (2) Email local parts take full RFC 5322 atext, quoted strings, comments and `Mc` letters (possessive and gated to 256 characters before the `@`, so they stay linear). (3) Lookalike slashes, full stops and dash-likes map into the gap set. (4) `Cs`, `Co` and `Cn` are stripped, so the output is always encodable. (5) The canonical declared-gaps list now lives in §1.3 and `docs/methodology.md` between `declared-gaps` markers, kept identical by a test. It adds digit-valued `No` characters without an NFKD digit form. U+00B7 and U+2022 move from not-covered to mapped. |
 | 0.2.5 | 2026-10-14 | **§1.3 `redact`. No symbol changes; normalisation made structural.** (1) NFKD, then every `Nd` → ASCII, then ALL combining marks removed (every diacritic, in all text), ALL `Cc` except TAB/LF/CR/VT/FF removed, then NFC. Per-character rules had let C0/C1 controls, marks after non-ASCII digits or whitespace, and marks inside emails split identifiers with verified=True. (2) IBAN groups take the 0–3 character gap class (dash, dot, slash, tab, double space), the trailing group included. (3) A merged span's HMAC input is its full normalised text, not a canonical form; this corrects a false sentence in 0.2.4. IBAN canonical = alphanumerics only. Declared trade-off: the overlapping IBAN scan can absorb a following 1–4 character word into a merged span, which loses that join. (4) Declared NOT covered: `,` `'` `:` `|` `_` `;` `·` `•` U+066B U+066C separators, gaps of 4+ characters, and IDN/non-ASCII-TLD emails. |
 | 0.2.4 | 2026-10-14 | **§1.3 `redact`. No symbol changes; detection widened (over-redaction bias), surrogates canonicalised.** (1) `phone` gaps are independent (0.2.3's matching-separator rule let `555 010-0100` through). (2) Digit detectors accept a 0–3 character gap of whitespace (TAB/LF included), `.`, `-` and `/`; `account` spans 8–12 digits with gaps. (3) Normalisation also strips `Default_Ignorable_Code_Point` (Unicode 15.0.0), U+2800, and combining marks after a digit or separator. (4) IBAN detection is case-insensitive. (5) The HMAC input is the canonical identifier, so one identifier shares a surrogate across layouts and case. A merged span's surrogate is not a standalone one. (6) Declared: the over-redaction shapes, normalised non-identifier text, and the absence of an offset map. |
 | 0.2.3 | 2026-10-14 | **§1.3 `redact` — no symbol changes; semantics tightened.** (1) The claim that verification catches "an identifier the first pass split, overlapped, or never had a pattern for" was wrong: verification only catches what a covered detector still recognises in the output. The mangling case is now prevented structurally (all detectors over the same text, overlapping spans merged and replaced whole). (2) `key` must be ≥ 32 bytes. (3) Input is Unicode-normalised before detection and `text` is the normalised text. (4) `RedactionResult.text` is excluded from `repr()`/`str()`. Coverage changes are declared in `docs/methodology.md`: added `digit_run` (20+ digits), `account` widened to 8–12 digits, spaced IBANs, and dot separators for cards. |

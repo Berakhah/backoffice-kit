@@ -1,3 +1,4 @@
+import json
 import re
 import time
 import unicodedata
@@ -230,6 +231,11 @@ _HOSTILE = {
     "long_upper": "AB12" + "A" * 200_000,
     "at_signs": "a@" * 100_000,
     "paren_groups": "(123)" * 40_000,
+    "double_quotes": '"' * 200_000,
+    "open_parens": "(" * 200_000,
+    "apostrophes": "a'" * 100_000,
+    "atext_run": "!#$%&'*+/=?^_`{|}~-" * 10_000,
+    "iban_national_run": "GB 82 " * 40_000,
 }
 
 
@@ -440,11 +446,13 @@ def test_an_iban_absorbs_a_short_following_word_and_redacts_it() -> None:
     """Declared over-redaction: the trailing group of an IBAN may be letters (Seychelles
     ends in 'USD', Malta in '01S'), so a 1-4 character word after an IBAN is taken too.
     Safe for the boundary; the cost is a different surrogate in that context."""
-    r = redact(_cc("SC52 BAHL 0103 1234 5678 9012 3456 USD and more"), key=KEY)
+    r = redact(_cc("SC52 BAHL 0103 1234 5678 9012 3456 USD and more; end"), key=KEY)
     assert r.verified is True
     assert "USD" not in r.text
     assert "BAHL" not in r.text
-    assert r.text.endswith(" more")
+    # Task 8b: the national-layout fallback absorbs words up to 30 letters/digits, here
+    # through an inner match ("HL 0103 ..."), so "and more" goes too. Declared.
+    assert r.text.endswith("; end")
 
 
 def test_an_iban_followed_by_a_short_word_loses_its_join_but_never_leaks() -> None:
@@ -468,6 +476,176 @@ def test_a_merged_span_does_not_share_the_standalone_identifiers_surrogate() -> 
     assert merged.verified is True
     assert "a@b.cc" not in merged.text
     assert merged.text != standalone.text
+
+
+# --- Task 8b: hardening -----------------------------------------------------------------
+
+
+def _only_surrogate_left(r: RedactionResult, before: str, after: str) -> bool:
+    """The identifier is gone WHOLE: nothing but one surrogate between the context words."""
+    return _leftover(r.text) == f"{before}\x00{after}"
+
+
+@pytest.mark.parametrize(
+    ("layout", "compact"),
+    [
+        # national display formats, not groups of four
+        ("MT84 MALT 01100 0012345MTLCAST001S", "MT84MALT011000012345MTLCAST001S"),
+        ("IT60 X 05428 11101 000000123456", "IT60X0542811101000000123456"),
+        ("FR76 30006 00001 12345678901 89", "FR7630006000011234567890189"),
+        ("BE68 539 0075470 34", "BE68539007547034"),
+        ("PT50 0002 0123 12345678901 54", "PT50000201231234567890154"),
+        ("CH93 00762 01162 38529 57", "CH9300762011623852957"),
+        ("NO93 8601 1117947", "NO9386011117947"),
+        ("SC18 SSCB 1101 0000 0000 0000 1497 USD", "SC18SSCB11010000000000001497USD"),
+        # the country code split from its check digits, groups of other widths
+        ("GB 82 WEST 1234 5698 7654 32", "GB82WEST12345698765432"),
+        ("GB82 WEST12 3456 98 7654 32", "GB82WEST12345698765432"),
+        ("GB 82 west12 3456-98.7654/32", "GB82WEST12345698765432"),
+        ("gb82 west12 3456-98.7654/32", "GB82WEST12345698765432"),
+    ],
+)
+def test_an_iban_in_a_national_layout_is_redacted_whole(layout: str, compact: str) -> None:
+    """'IT60 X [DIGIT_RUN]', '[IBAN]MTLCAST001S', 'GB 82 WEST [CARD]' and 'GB82 WE[IBAN]'
+    all verified=True with a prefix or tail of the IBAN left in the text."""
+    r = redact(_cc(f"pay {layout}; now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"iban": 1}
+    assert _only_surrogate_left(r, "pay ", "; now"), r.text
+    assert r.text == redact(_cc(f"pay {compact}; now"), key=KEY).text  # joins survive
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "jane.o'connor@corp.test",  # was "jane.o'[EMAIL]"
+        "first&last@corp.test",
+        "a!b#c$d%e&f'g*h+i/j=k?l^m_n`o{p|q}r~s@x.test",
+        '"john smith"@x.test',
+        "ana(comment)@x.test",
+        "(comment)ana@x.test",
+        # EAI: Devanagari local part (vowel signs are Mc, outside \w)
+        "\u092a\u094d\u0930\u093f\u092f\u093e.\u0936\u0930\u094d\u092e\u093e@x.test",
+    ],
+)
+def test_an_email_with_a_full_rfc5322_local_part_is_redacted_whole(email: str) -> None:
+    r = redact(_cc(f"mail {email} now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"email": 1}
+    assert _only_surrogate_left(r, "mail ", " now"), r.text
+
+
+@pytest.mark.parametrize(
+    ("separator", "maps_to"),
+    [
+        ("\u2044", "/"),  # fraction slash
+        ("\u2215", "/"),  # division slash
+        ("\u29f8", "/"),  # big solidus
+        ("\uff0f", "/"),  # full-width solidus (NFKD)
+        ("\u2571", "/"),  # box drawings diagonal
+        ("\u3002", "."),  # ideographic full stop
+        ("\uff61", "."),  # halfwidth ideographic full stop
+        ("\uff0e", "."),  # full-width full stop (NFKD)
+        ("\u06d4", "."),  # arabic full stop
+        ("\u00b7", "."),  # middle dot
+        ("\u2022", "."),  # bullet
+        ("\u30fb", "."),  # katakana middle dot
+        ("\u30fc", "-"),  # katakana prolonged sound mark
+        ("\uff70", "-"),  # halfwidth prolonged sound mark
+        ("\u2500", "-"),  # box drawings light horizontal
+        ("\u2501", "-"),  # box drawings heavy horizontal
+        ("\u2796", "-"),  # heavy minus sign
+        ("\u02d7", "-"),  # modifier letter minus sign
+        ("\u2043", "-"),  # hyphen bullet
+        ("\u23af", "-"),  # horizontal line extension
+    ],
+)
+def test_lookalike_separators_are_mapped_into_the_gap_set(separator: str, maps_to: str) -> None:
+    import bok_core.boundary.redact as m
+
+    assert m._normalise(separator) == maps_to
+    r = redact(_cc("card " + separator.join(["4111"] * 4) + "; now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"card": 1}
+    assert _only_surrogate_left(r, "card ", "; now"), r.text
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        chr(0xD800),  # lone high surrogate (JS strings reach Python via JSON this way)
+        chr(0xDFFF),  # lone low surrogate
+        "\ue000",  # private use (Co)
+        "\U000f0000",  # supplementary private use plane A
+        "\U00100000",  # supplementary private use plane B
+        "\u0378",  # unassigned (Cn)
+    ],
+)
+def test_surrogates_private_use_and_unassigned_code_points_are_stripped(junk: str) -> None:
+    r = redact(_cc(f"card 4111{junk} 1111{junk}1111 1111{junk}; now"), key=KEY)
+    assert r.verified is True
+    assert r.surrogate_count == {"card": 1}
+    assert _only_surrogate_left(r, "card ", "; now"), r.text
+    # The result is always serialisable: no lone surrogate survives into the output.
+    r.text.encode("utf-8")
+    assert r.model_dump_json()
+    assert json.loads(json.dumps(r.model_dump(), ensure_ascii=False))
+
+
+def test_a_lone_surrogate_anywhere_never_reaches_the_output() -> None:
+    r = redact(_cc("note " + chr(0xD83D) + " end " + chr(0xDE00)), key=KEY)
+    r.text.encode("utf-8")
+    assert r.text == "note  end "
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "ana@x.t\u00e9st",  # precomposed e-acute: NFKC keeps it, the [A-Za-z] TLD fails
+        "ana@x.te\u0301st",  # decomposed: NFKC would compose it into the same e-acute
+        "\u00e1na@x.test",
+    ],
+)
+def test_a_precomposing_mark_in_an_email_is_pinned(variant: str) -> None:
+    """Pins NFKD-then-strip. Under NFKC-then-strip, 'e' + U+0301 composes to U+00E9 (Ll),
+    survives the Mn strip, and the email leaks with verified=True."""
+    import bok_core.boundary.redact as m
+
+    assert m._normalise(variant) == "ana@x.test"
+    plain = redact(_cc("mail ana@x.test now"), key=KEY)
+    assert redact(_cc(f"mail {variant} now"), key=KEY).text == plain.text
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "GB82 W\u00c9ST 1234 5698 7654 32",  # precomposed E-acute in a BBAN letter
+        "GB82 WE\u0301ST 1234 5698 7654 32",  # E + combining acute
+        "G\u0302B82 WEST 1234 5698 7654 32",  # mark on the country code
+    ],
+)
+def test_combining_marks_on_iban_letters_do_not_defeat_detection(variant: str) -> None:
+    r = redact(_cc(f"pay {variant}; now"), key=KEY)
+    assert r.verified is True
+    assert r.text == redact(_cc("pay GB82WEST12345698765432; now"), key=KEY).text
+
+
+def _declared_gaps(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    start = text.index("<!-- declared-gaps:start -->")
+    end = text.index("<!-- declared-gaps:end -->")
+    return [line.strip() for line in text[start:end].splitlines()[1:] if line.strip()]
+
+
+def test_declared_gaps_match_between_methodology_and_contract() -> None:
+    """The contract's declared-gaps list and methodology.md's must be the same list."""
+    docs = Path(__file__).parents[2] / "docs"
+    in_methodology = _declared_gaps(docs / "methodology.md")
+    in_contract = _declared_gaps(docs / "INTERFACE-CONTRACT.md")
+    assert in_methodology == in_contract
+    joined = " ".join(in_methodology)
+    for named in ("U+2776", "Ethiopic", "Kharoshthi", "Brahmi", "Rumi", "IDN"):
+        assert named in joined, named
 
 
 # --- Properties -------------------------------------------------------------------------
@@ -506,8 +684,40 @@ def _iban(draw: st.DrawFn) -> str:
     return f"{cc}{check}{body}"
 
 
+@st.composite
+def _iban_national(draw: st.DrawFn) -> str:
+    """National display formats: country code, optional gap, check digits, then 11-30
+    letters/digits cut into groups of ANY width by covered gaps, either case."""
+    cc = draw(st.sampled_from(["GB", "gb", "MT", "IT", "Fr"]))
+    check = draw(st.from_regex(r"[0-9]{2}", fullmatch=True))
+    body = draw(st.from_regex(r"[A-Za-z0-9]{11,30}", fullmatch=True))
+    cuts = sorted(set(draw(st.lists(st.integers(1, len(body) - 1), max_size=6))))
+    pieces = [body[a:b] for a, b in zip([0, *cuts], [*cuts, len(body)], strict=True)]
+    gap = draw(st.sampled_from(["", " ", "-"]))
+    cc = cc.upper() if gap else cc  # a gapped country code is printed upper-case
+    return f"{cc}{gap}{check}" + "".join(draw(_IBAN_GAP) + p for p in pieces)
+
+
+_ATEXT = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]"
+
+_EMAIL_LOCAL = st.one_of(
+    st.from_regex(rf"{_ATEXT}{{1,10}}(\.{_ATEXT}{{1,6}})?", fullmatch=True),
+    st.from_regex(r'"[a-z ]{1,8}"', fullmatch=True),
+    st.from_regex(r"[a-z]{1,4}\([a-z]{1,6}\)", fullmatch=True),
+)
+
+
+@st.composite
+def _email(draw: st.DrawFn) -> str:
+    local = draw(_EMAIL_LOCAL)
+    domain = draw(st.from_regex(r"[a-z]{1,8}\.test", fullmatch=True))
+    return f"{local}@{domain}"
+
+
 _TAGGED = st.one_of(
     st.tuples(st.just("email"), st.from_regex(r"[a-z]{1,8}@[a-z]{1,8}\.test", fullmatch=True)),
+    st.tuples(st.just("email"), _email()),
+    st.tuples(st.just("iban"), _iban_national()),
     st.tuples(st.just("phone"), _phone()),
     st.tuples(st.just("iban"), st.from_regex(r"GB[0-9]{2}[A-Z0-9]{14}", fullmatch=True)),
     st.tuples(
@@ -533,7 +743,11 @@ def _noisy(draw: st.DrawFn, tagged: tuple[str, str]) -> tuple[str, str]:
         if ch == " ":
             out.append(draw(st.sampled_from([" ", "\u00a0", "\u202f", "\u2009"])))
         elif ch == "-":
-            out.append(draw(st.sampled_from(["-", "\u2013", "\u2014", "\u2212", "\u2011"])))
+            out.append(draw(st.sampled_from(_DASHES)))
+        elif ch == "/":
+            out.append(draw(st.sampled_from(["/", "\u2044", "\u2215", "\uff0f", "\u2571"])))
+        elif ch == "." and kind != "email":
+            out.append(draw(st.sampled_from([".", "\u3002", "\uff61", "\uff0e", "\u00b7"])))
         elif ch.isdigit() and draw(st.integers(0, 3)) == 0:
             out.append(chr(zero + int(ch)))
         else:
@@ -544,6 +758,8 @@ def _noisy(draw: st.DrawFn, tagged: tuple[str, str]) -> tuple[str, str]:
             out.append(draw(st.sampled_from(["\u0301", "\u0308", "\u20dd", "\u200d"])))
     return kind, "".join(out)
 
+
+_DASHES = ["-", "\u2013", "\u2014", "\u2212", "\u2011", "\u30fc", "\u2500", "\u2796"]
 
 _DIGIT_ZEROS = [
     0x0030,  # ASCII
@@ -561,6 +777,9 @@ _DIGIT_ZEROS = [
 
 _BETWEEN_DIGITS = [
     *[""] * 8,
+    chr(0xD800),  # lone surrogate (Cs)
+    "\ue000",  # private use (Co)
+    "\u0378",  # unassigned (Cn)
     "\u200b",  # zero-width space (Cf)
     "\u00ad",  # soft hyphen (Cf)
     "\u2060",  # word joiner (Cf)

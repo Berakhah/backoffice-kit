@@ -12,10 +12,10 @@ that every kind named there is also named here.
 
 | `00` §4.2 class | Status | Detector kind(s) | Shapes recognised (after normalisation, below) |
 |---|---|---|---|
-| Emails | Covered (ASCII TLD) | `email` | `local@domain.tld`; local part 0–64 chars of `[\w.%+-]`, so a bare `@domain.tld` residue is also redacted; the TLD must be ASCII letters |
+| Emails | Covered (ASCII TLD) | `email` | `local@domain.tld`. The local part follows RFC 5322: atext (letters, digits and ``! # $ % & ' * + - / = ? ^ _ ` { | } ~``, plus dots), quoted strings (`"john smith"`), parenthesised comments (`ana(comment)`), and Unicode letters including spacing marks (`Mc`, so Devanagari EAI local parts are covered). It is up to 64 items and may be empty, so a bare `@domain.tld` residue is also redacted. The TLD must be ASCII letters |
 | Phones | Covered (NANP shape) | `phone` | optional `+CC` (1–3 digits) prefix; `(ddd)` or `ddd`; then `ddd` and `dddd`, each gap independent (`555-010-0100`, `555 010-0100`, `555/010.0100`, `5550100100`) |
 | Tax ids | Covered (US shapes only) | `tax_id` | EIN `12-3456789`; SSN/ITIN `123-45-6789` (hyphenated; other layouts are still caught as digit runs) |
-| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or in groups of four with the same gap before every group, the trailing 1–4 character group included (`GB82 WEST 1234 5698 7654 32`, `GB82-WEST-1234-5698-7654-32`, `MT84  MALT  0110  0001  2345  MTLC  AST0  01S`, `GB82WEST 1234 ...`) (`iban`) |
+| Bank / routing numbers | Covered (partial) | `routing`, `account`, `iban`, `card`, `digit_run` | 9 contiguous digits (`routing`); 8–12 digits (`account`); 13–19 digits (`card`); 20+ digits (`digit_run`) — the last three with an optional gap (below) between any two digits; IBAN, case-insensitive, compact `NL91ABNA0417164300` or in groups of four with the same gap before every group, the trailing 1–4 character group included (`GB82 WEST 1234 5698 7654 32`, `GB82-WEST-1234-5698-7654-32`, `MT84  MALT  0110  0001  2345  MTLC  AST0  01S`, `GB82WEST 1234 ...`); plus **national display formats** with groups of any width: an optional gap between country code and check digits, then 11–30 letters/digits each optionally preceded by a gap (`IT60 X 05428 11101 000000123456`, `FR76 30006 00001 12345678901 89`, `MT84 MALT 01100 0012345MTLCAST001S`, `GB 82 WEST ...`). When the code and check digits are separated by a gap, the code must be upper case (`iban`) |
 | Addresses | **NOT covered** | `address` (declared, no detector) | — |
 | Person names | **NOT covered** | `person_name` (declared, no detector) | — |
 
@@ -46,9 +46,20 @@ text — all of it, not only the identifiers** (see "Output text" below):
      Python 3.12 implements). This includes CGJ U+034F, the variation selectors, the
      Hangul fillers U+115F/U+1160/U+3164/U+FFA0, Khmer U+17B4/17B5 and Mongolian
      U+180B–180F;
-   - the braille pattern blank U+2800.
+   - the braille pattern blank U+2800;
+   - lone surrogates (`Cs`, which reach Python from JavaScript strings via JSON and would
+     make the output unencodable), private use (`Co`) and unassigned code points (`Cn`,
+     as of Unicode 15.0.0).
 4. Every space separator (`Zs`) becomes an ASCII space. Every dash (`Pd`) and the minus
-   sign U+2212 becomes an ASCII hyphen.
+   sign U+2212 becomes an ASCII hyphen. **Lookalike separators** are mapped into the gap
+   set:
+   - slashes U+2044, U+2215, U+29F8 and U+2571 → `/`;
+   - full stops and dots U+3002 (U+FF61 decomposes to it), U+06D4, U+2E3C, U+00B7,
+     U+2022, U+2027, U+2219 and U+30FB → `.`;
+   - dash-likes U+30FC (with U+FF70), U+02D7, U+2043, U+2796, U+23AF and the box-drawing
+     horizontals → `-`.
+
+   NFKD already folds U+FF0F, U+FF0E, U+2024 and U+FE52 to ASCII.
 5. NFC, which only recomposes what is left (Hangul syllables).
 
 After that, the **gap** the digit detectors (`phone`, `account`, `card`, `digit_run`) and
@@ -57,12 +68,8 @@ the IBAN groups accept is nothing, or a run of **1 to 3** characters from: white
 innerText of a table row), `4111<LF>1111`, `4111 - 1111` and `4111/1111` each form one
 run.
 
-**Not covered — each of these ENDS a run**, and a run that ends with fewer than 8 digits
-is not redacted:
-- the separators `,` `'` `:` `|` `_` `;` `·` (U+00B7) `•` (U+2022), the Arabic decimal
-  separator U+066B and the Arabic thousands separator U+066C, and any other character
-  outside the gap set, letters included (`1234,5678` and `1234_5678` are NOT redacted);
-- gaps of 4 or more gap characters (`4111    1111`).
+Anything else **ends** a run, including the separators listed under "Declared gaps"
+below. A run that ends with fewer than 8 digits is not redacted.
 
 ### Surrogates and joins
 
@@ -108,15 +115,20 @@ document containing a person's name or a street address is not `REDACTED` — it
 `CLIENT_CONFIDENTIAL`**, whatever `redact()` returns. `verified=True` means only "no
 *covered* detector fires on the output".
 
-### Known gaps inside the covered classes
+### Declared gaps (canonical list)
 
-- Account numbers shorter than 8 digits are not detected. Neither are digit groups split
-  by a separator outside the gap set or by a gap of 4+ characters (the "Not covered" list
-  above).
-- **Emails with an IDN or non-ASCII TLD** (`user@example.рф`, `user@例え.テスト`) are not
-  detected. Neither are local parts that use characters outside `[\w.%+-]`.
-- Non-US tax ids and non-NANP phone layouts are not detected as such, although their
-  8+-digit runs are still caught as digit runs.
+This list is the single source. `docs/INTERFACE-CONTRACT.md` §1.3 carries the identical
+list between the same markers, and `tests/boundary/test_redact.py` asserts that the two
+are equal.
+
+<!-- declared-gaps:start -->
+- Addresses and person names: no detector yet (a local NER model is planned for week 5).
+- Digit groups split by `,` `'` `:` `|` `_` `;`, U+066B or U+066C, or by any other character outside the gap set and its mapped lookalikes. Box-drawing verticals and corners, and dingbat slashes and dashes not in `_LOOKALIKE`, are not mapped.
+- Gaps of 4 or more gap characters between digit groups.
+- Account numbers shorter than 8 digits. Non-US tax ids and non-NANP phone layouts are not detected as such, though their runs of 8+ digits are still caught.
+- Emails with an IDN or non-ASCII TLD, emails with comments or quoted strings in the domain part, and local parts of more than 64 items or starting more than 256 characters before the `@`.
+- Digit-valued `No` characters without an NFKD digit form: dingbat negative-circled digits (U+2776-U+277F), double-circled digits (U+24F5-U+24FE), Ethiopic (U+1369-U+137C), Kharoshthi (U+10A40-U+10A48), Brahmi (U+11052-U+11065), Rumi (U+10E60-U+10E7E), and similar.
+<!-- declared-gaps:end -->
 
 ### Over-redaction (declared, deliberate)
 
@@ -145,6 +157,19 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
   not its standalone surrogate**: the join is lost, but nothing leaks and there is no
   false join. Followed by `;`, `,`, `)` or end of text, an IBAN keeps its standalone
   (canonical) surrogate.
+- **National-layout IBAN fallback:** after an IBAN-like prefix (two letters, optionally
+  a gap when they are upper case, then two digits), the next 30 letters and digits are
+  taken. They are counted across gap-separated words of any width, and the 30th may fall
+  mid-word. With fewer than 30 available, the run ends at the last word boundary.
+  An IBAN-like prefix *inside* the IBAN (`ST12` in `…WEST12…`) starts another such match.
+  So prose after an IBAN can lose up to roughly 40 letters/digits, up to the next
+  character outside the gap set (`,` `;` `:` ...). Examples:
+  - `IN 20 MINUTES WE LEFT` is redacted;
+  - `GB82WEST12345698765432 for the invoice now` loses `for the invoice now`;
+  - `SC52 BAHL ... USD and more` loses `and more`.
+
+  The span's surrogate is then context-specific: the join is lost, but nothing leaks.
+  Lower-case prose such as `on 12 March 2026` is not affected.
 - **Glued identifiers:** identifiers glued together with no separator are redacted (no
   fragment of either survives, property-tested), but they merge into one span with one
   surrogate.
