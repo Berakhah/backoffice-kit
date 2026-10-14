@@ -65,12 +65,13 @@ class RedactionFailed(Exception):
 # accepted exactly one of space/hyphen/dot, and digit groups split any other way passed
 # through with verified=True. The cost is over-redaction: rows of small numbers, prices,
 # dates and IP addresses become `account`/`card`/`digit_run` (declared in methodology.md).
-# A gap character is also a JSON two-character escape of whitespace or slash (backslash +
-# t, n, r, f, b or /): the contract covers ONE layer of JSON string escaping, and DOM
-# table innerText is TAB-separated, so json.dumps of "4111<TAB>1111<TAB>..." wrote
-# '4111' + backslash-t + '1111' ... and the card passed fully unredacted with
-# verified=True. Each escape counts as ONE gap character (same 0-3 bound).
-_JSON_GAP_ESCAPE = r"\\[tnrfb/]"
+# A gap character is also a JSON two-character escape of whitespace (backslash + t, n,
+# r or f): the contract covers ONE layer of JSON string escaping, and DOM table
+# innerText is TAB-separated, so json.dumps of "4111<TAB>1111<TAB>..." wrote '4111' +
+# backslash-t + '1111' ... and the card passed fully unredacted with verified=True. Each
+# escape counts as ONE gap character (same 0-3 bound). "\b" and "\/" are not here:
+# normalisation decodes them (_decode_json_escapes).
+_JSON_GAP_ESCAPE = r"\\[tnrf]"
 _GAP_CHAR = rf"(?:[\s./\-]|{_JSON_GAP_ESCAPE})"
 _GAP = rf"{_GAP_CHAR}{{0,3}}"
 
@@ -97,12 +98,23 @@ _MC = "".join(chr(cp) for cp in range(0x0900, 0x1D200) if unicodedata.category(c
 # left the start of the address behind.
 _QUOTED_ITEMS = 64  # items in one quoted string
 _ESCAPE_RUN = 8  # longest backslash run the nested-JSON form reads as one escape
+# No quoted string of any form is a JSON SEPARATOR: whitespace and brackets around at
+# least one ":" or "," (and backslashes, for the escaped forms). Otherwise
+# '{"k": "ana@x.test"}' read 'k": "ana' as a local part -- atext "k", the quoted string
+# '": "', atext "ana" -- and the span swallowed the key and the punctuation:
+# '{"[EMAIL:...]"}', no longer JSON. A real quoted local part is never such a separator;
+# one that is ('jo", "smith@x.test') ends the local part there (declared), and the
+# address after it is still redacted. '" "' and '"[]"' stay quoted strings.
+_NOT_PUNCTUATION = r'(?![\s\[\]{}]*[:,][\s:,\[\]{}]*")'
+_NOT_ESCAPED_PUNCTUATION = r'(?![\s\[\]{}\\]*[:,][\s:,\[\]{}\\]*")'
 # RFC 5322: a character or a quoted-pair ("\x", 2 characters).
-_QUOTED = rf'"(?:[^"\\\r\n]|\\.){{1,{_QUOTED_ITEMS}}}"'
+_QUOTED = rf'"{_NOT_PUNCTUATION}(?:[^"\\\r\n]|\\.){{1,{_QUOTED_ITEMS}}}"'
 # JSON-escaped (evidence is stored as JSON: '"jo smith"@x.test' becomes
 # '\"jo smith\"@x.test'): ends at a backslash-quote; an RFC quoted-pair inside it is
 # the 4-character '\\\"'; any other escape is 2 characters.
-_QUOTED_JSON = rf'"(?:[^"\\\r\n]|\\\\\\"|\\[^"\r\n]){{1,{_QUOTED_ITEMS}}}\\"'
+_QUOTED_JSON = (
+    rf'"{_NOT_ESCAPED_PUNCTUATION}(?:[^"\\\r\n]|\\\\\\"|\\[^"\r\n]){{1,{_QUOTED_ITEMS}}}\\"'
+)
 # JSON-escaped more than once (a JSON string holding JSON): any run of 1-8 backslashes
 # before a quote ends it, and a run before any other character is one escape. EXTRA
 # coverage, not a guarantee: the contract covers decoded text plus ONE layer of JSON
@@ -110,7 +122,7 @@ _QUOTED_JSON = rf'"(?:[^"\\\r\n]|\\\\\\"|\\[^"\r\n]){{1,{_QUOTED_ITEMS}}}\\"'
 # covered ('"jonathan\"smith"' keeps "jonathan"; declared). Callers redact values
 # before serialising them.
 _QUOTED_JSON_NESTED = (
-    rf'"(?:[^"\\\r\n]|\\{{1,{_ESCAPE_RUN}}}[^"\\\r\n]){{1,{_QUOTED_ITEMS}}}'
+    rf'"{_NOT_ESCAPED_PUNCTUATION}(?:[^"\\\r\n]|\\{{1,{_ESCAPE_RUN}}}[^"\\\r\n]){{1,{_QUOTED_ITEMS}}}'
     rf'\\{{1,{_ESCAPE_RUN}}}"'
 )
 # The farthest a quoted string of any form reaches past its opening quote: 64 items of
@@ -126,7 +138,7 @@ _QUOTED_MAX = max(
 # string whose last character is a backslash ('"C:\dir\"@x.test') reads in the RFC form
 # as an escaped quote that never closes; this keeps it an address (over-redaction). It
 # holds no quote and spans at most 66 characters, inside _QUOTED_MAX.
-_QUOTED_LENIENT = rf'"[^"\r\n]{{1,{_QUOTED_ITEMS}}}"'
+_QUOTED_LENIENT = rf'"{_NOT_PUNCTUATION}[^"\r\n]{{1,{_QUOTED_ITEMS}}}"'
 _COMMENT = r"\((?:[^()\r\n]|\([^()\r\n]{0,64}\)){0,64}\)"
 _ATEXT_ITEM = rf"[\w!#$%&'*+/=?^`{{|}}~.\-{_MC}]"
 
@@ -562,6 +574,27 @@ _STRIPPED_CATEGORIES = frozenset({"Cf", "Mn", "Me", "Cs", "Co", "Cn"})
 _KEPT_CONTROLS = frozenset("\t\n\r\x0b\x0c")
 
 
+# One-layer JSON escapes decoded IN PLACE, the way a decoder would, where the result is
+# still valid JSON: an escaping "\b" (a BACKSPACE, U+0008 -- a control character that
+# normalisation strips from decoded text at no cost) is removed, and an escaping "\/"
+# (PHP's json_encode writes every "/" so) becomes "/". As escapes they counted as a gap
+# unit or ended an email: "4111" + 4 x "\b" + "1111..." kept the whole card, and
+# "jonathan\/smith@x.test" kept "jonathan". A pair "\\" is consumed first, so
+# "\\b" (a literal backslash, then "b") is left as written.
+_DECODED_ESCAPE_RE = re.compile(r"\\(?:\\|(b)|/)")
+
+
+def _decode_json_escape(match: re.Match[str]) -> str:
+    text = match.group(0)
+    if text[1] == "\\":
+        return text
+    return "" if match.group(1) else "/"
+
+
+def _decode_json_escapes(text: str) -> str:
+    return _DECODED_ESCAPE_RE.sub(_decode_json_escape, text) if "\\" in text else text
+
+
 def _normalise(text: str) -> str:
     """Structural, not per-character. After NFKD (compatibility DEcomposition, so every
     precomposed letter splits into base + combining mark):
@@ -574,7 +607,10 @@ def _normalise(text: str) -> str:
       blank-rendering characters above;
     - lookalike slashes, full stops and dash-likes -> '/', '.', '-' (_LOOKALIKE);
     - every Unicode space (Zs) -> ' '; every dash (Pd) and the minus sign -> '-';
-    - then NFC, which only recomposes what is left (Hangul syllables).
+    - then NFC, which only recomposes what is left (Hangul syllables);
+    - then the JSON escapes "\\b" (removed) and "\\/" (-> "/") are decoded
+      (_decode_json_escapes), so text outside identifiers changes too ("C:\\bin" ->
+      "C:in").
 
     Decomposing first is what makes the mark rule structural: under NFKC, "e" + U+0301
     composes to "e-acute" (a letter, Ll), survives a strip of Mn, and breaks the
@@ -601,7 +637,7 @@ def _normalise(text: str) -> str:
             out.append("-")
         else:
             out.append(ch)
-    return unicodedata.normalize("NFC", "".join(out))
+    return _decode_json_escapes(unicodedata.normalize("NFC", "".join(out)))
 
 
 def _canonical(kind: str, identifier: str) -> str:

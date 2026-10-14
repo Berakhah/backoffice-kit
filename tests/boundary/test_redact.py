@@ -1361,6 +1361,8 @@ _JSON_VALUE = st.one_of(
     st.tuples(_JSON_TEXT, _TAGGED.flatmap(_noisy), _JSON_TEXT).map(
         lambda t: f"{t[0]} {t[1][1]} {t[2]}"
     ),
+    # the identifier IS the whole value: it sits right against the JSON string's quotes
+    _TAGGED.map(lambda t: t[1]),
 )
 
 
@@ -1370,12 +1372,16 @@ _JSON_VALUE = st.one_of(
         st.from_regex(r"[a-z]{1,6}", fullmatch=True), _JSON_VALUE, min_size=1, max_size=4
     ),
     ensure_ascii=st.booleans(),
+    compact=st.booleans(),
 )
-def test_redacted_json_evidence_stays_parseable(obj: dict[str, str], ensure_ascii: bool) -> None:
+def test_redacted_json_evidence_stays_parseable(
+    obj: dict[str, str], ensure_ascii: bool, compact: bool
+) -> None:
     """Random JSON objects whose string values hold covered identifiers (with Unicode
     separators, digits and format characters, which ensure_ascii writes as \\uXXXX):
     the redacted document verifies and still parses, with the same keys."""
-    r = redact(_cc(json.dumps(obj, ensure_ascii=ensure_ascii)), key=KEY)
+    separators = (",", ":") if compact else None
+    r = redact(_cc(json.dumps(obj, ensure_ascii=ensure_ascii, separators=separators)), key=KEY)
     assert r.verified is True, r.failures
     loaded = json.loads(r.text)
     assert isinstance(loaded, dict)
@@ -1444,3 +1450,166 @@ def test_identifiers_in_json_evidence_are_redacted_whole(tagged: list[tuple[str,
         for _, value in tagged:
             normal = m._normalise(value)
             assert not _fragments(normal) & _fragments(left), (document, decoded)
+
+
+# --- Task 8b fix round 5: \b and \/ are decoded the way a JSON decoder would --------------
+#
+# json.dumps writes a decoded BACKSPACE (U+0008, a control character that normalisation
+# strips at no cost) as the two characters backslash + "b", and PHP's json_encode writes
+# every "/" as backslash + "/". Normalisation now removes an escaping "\b" and turns an
+# escaping "\/" into "/": the result is still valid JSON, and it is what detection would
+# have seen in the decoded text.
+
+_BK = chr(8)
+
+
+def _php(document: str) -> str:
+    """PHP json_encode's default: every "/" escaped."""
+    return document.replace("/", _BS + "/")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        _BK.join(["4111", "", "", "", "1111", "", "", "", "1111", "", "", "", "1111"]),
+        "4111" + _TAB + _BK + " " + _TAB + "1111" + _TAB + "1111" + _TAB + "1111",
+        "12345" + _BK * 4 + "678",
+        "GB82" + _BK * 4 + "WEST12345698765432",
+        "jonathan" + _BK + "@x.test",
+        "ana@exa" + _BK + "mple.test",
+        "jo" + _BK + "nathan.smith@x.test",
+    ],
+)
+def test_a_json_escaped_backspace_costs_nothing_as_in_decoded_text(value: str) -> None:
+    """Decoded, a backspace is stripped and joins what it splits. In JSON text it was the
+    2-character escape and counted as a gap unit (or ended an email): every value here
+    kept a whole identifier or a 4+ character part of one with verified=True."""
+    import bok_core.boundary.redact as m
+
+    r = redact(_cc(json.dumps({"k": f"pay {value}; now"})), key=KEY)
+    assert r.verified is True, r.failures
+    decoded = json.loads(r.text)["k"]
+    assert decoded.startswith("pay ") and decoded.endswith("; now"), decoded
+    assert not _fragments(m._normalise(value)) & _fragments(_leftover(decoded)), decoded
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "mail jonathan/smith@x.test now",
+        "mail jonathan.smith/sales@x.test now",
+        "pay 4111/1111/1111/1111; now",
+        "pay GB82/WEST/1234/5698/7654/32; now",
+    ],
+)
+def test_a_php_escaped_slash_is_a_slash(value: str) -> None:
+    """{"k": "mail jonathan\\/smith@x.test now"} -> "mail jonathan[EMAIL]": the escaped
+    slash ended the local part. One layer of JSON escaping: it is a "/"."""
+    import bok_core.boundary.redact as m
+
+    r = redact(_cc(_php(json.dumps({"k": value}))), key=KEY)
+    assert r.verified is True, r.failures
+    decoded = json.loads(r.text)["k"]
+    identifier = value.split(" ")[1].rstrip(";")
+    assert not _fragments(m._normalise(identifier)) & _fragments(_leftover(decoded)), decoded
+
+
+@pytest.mark.parametrize(
+    ("text", "normal"),
+    [
+        (f"a{_BS}bc", "ac"),  # an escaping \b is removed
+        (f"a{_BS}/c", "a/c"),  # an escaping \/ is a slash
+        (f"C:{_BS}{_BS}bin", f"C:{_BS}{_BS}bin"),  # \\ then b: a literal backslash
+        (f"x{_BS}{_BS}/y", f"x{_BS}{_BS}/y"),  # \\ then /: a literal backslash
+        (f"{_BS}{_BS}{_BS}b", f"{_BS}{_BS}"),  # \\ then \b
+        (f"{_BS}{_BS}{_BS}/", f"{_BS}{_BS}/"),  # \\ then \/
+        (f"{_BS}{_BS}{_BS}{_BS}b", f"{_BS}{_BS}{_BS}{_BS}b"),  # \\ \\ then b
+        (f"{_BS}nb {_BS}tb", f"{_BS}nb {_BS}tb"),  # other escapes untouched
+    ],
+)
+def test_only_an_escaping_backslash_is_decoded(text: str, normal: str) -> None:
+    """A backslash escapes only after an even run of backslashes; '\\\\b' is a literal
+    backslash followed by 'b' and must survive as written."""
+    import bok_core.boundary.redact as m
+
+    assert m._normalise(text) == normal
+
+
+@st.composite
+def _with_backspaces(draw: st.DrawFn, tagged: tuple[str, str]) -> tuple[str, str]:
+    """Backspaces anywhere in an identifier -- between digit/IBAN groups, inside an email
+    local part or domain. Decoded, they are stripped; json.dumps writes each as '\\b'."""
+    kind, value = tagged
+    out = []
+    for ch in value:
+        out.append(ch)
+        if draw(st.integers(0, 4)) == 0:
+            out.append(_BK * draw(st.integers(1, 4)))
+    return kind, "".join(out)
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    tagged=st.lists(_TAGGED_SEPARATED.flatmap(_with_backspaces), min_size=1, max_size=5),
+    php=st.booleans(),
+)
+def test_identifiers_with_backspaces_and_php_slashes_in_json_are_redacted_whole(
+    tagged: list[tuple[str, str]], php: bool
+) -> None:
+    """The depth-1 property with the two decoder-normalised escapes: backspaces inside
+    any identifier, and PHP-style '\\/' for every slash (separators, atext)."""
+    import bok_core.boundary.redact as m
+
+    text = "<< " + " ; ".join(v for _, v in tagged) + " >>"
+    for document in (json.dumps({"k": text}), json.dumps([text, "x"])):
+        document = _php(document) if php else document
+        r = redact(_cc(document), key=KEY)
+        assert r.verified is True, r.failures
+        loaded = json.loads(r.text)
+        decoded = loaded["k"] if isinstance(loaded, dict) else loaded[0]
+        left = _leftover(decoded)
+        for _, value in tagged:
+            assert not _fragments(m._normalise(value)) & _fragments(left), (document, decoded)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"k": "ana@x.test"},
+        {"k": "x", "m": "ana@x.test"},
+        ["a", "ana@x.test"],
+        {"to": ["jo@x.test", "ana@x.test"]},
+        {"k": "jonathan.smith@x.test", "n": 1},
+    ],
+)
+@pytest.mark.parametrize("compact", [False, True])
+def test_an_email_that_is_a_whole_json_value_does_not_swallow_the_structure(
+    obj: dict[str, object] | list[str], compact: bool
+) -> None:
+    """{"k": "ana@x.test"} was redacted to {"[EMAIL:...]"}: the RFC grammar read
+    'k": "ana' as a local part -- atext "k", the quoted string '": "', atext "ana" -- so
+    the key and the JSON punctuation went into the span and the document no longer
+    parsed. A quoted string holding only JSON punctuation (whitespace : , [ ] { }) is not
+    a quoted local part."""
+    separators = (",", ":") if compact else None
+    r = redact(_cc(json.dumps(obj, separators=separators)), key=KEY)
+    assert r.verified is True, r.failures
+    loaded = json.loads(r.text)
+    if isinstance(obj, dict):
+        assert isinstance(loaded, dict) and loaded.keys() == obj.keys()
+    else:
+        assert isinstance(loaded, list) and len(loaded) == len(obj)
+    assert "ana" not in _leftover(r.text) and "jonathan" not in _leftover(r.text)
+
+
+def test_a_json_separator_is_never_a_quoted_local_part() -> None:
+    """Declared: a quoted string that is a JSON separator (whitespace and brackets around
+    ":" or ",") ends the local part, so 'jo", "smith@x.test' keeps 'jo", "' -- the
+    address after it is still redacted. A quoted string of whitespace alone is not a
+    separator: 'jonathan" "smith@x.test' is redacted whole."""
+    r = redact(_cc('mail jo", "smith@x.test now'), key=KEY)
+    assert r.verified is True
+    assert "smith" not in _leftover(r.text)
+    assert 'jo", "' in r.text
+    whole = redact(_cc('mail jonathan" "smith@x.test now'), key=KEY)
+    assert _leftover(whole.text) == "mail " + chr(0) + " now", whole.text

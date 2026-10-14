@@ -102,7 +102,9 @@ The redacted text is the normalised text, so text outside the identifiers change
 - ligatures are split (`ﬁ` → `fi`) and superscripts flattened (`²` → `2`);
 - full-width letters and other compatibility forms are folded;
 - digits of every script become ASCII;
-- bidi marks and ZWJ inside emoji sequences are removed.
+- bidi marks and ZWJ inside emoji sequences are removed;
+- the JSON escapes `\b` (removed) and `\/` (→ `/`) are decoded wherever the backslash is
+  not itself escaped, so `C:\bin` becomes `C:in`.
 
 **No offset map from the output back into the original is provided.** A consumer that
 needs to align the two must normalise the original with the same rules (`_normalise`).
@@ -129,10 +131,11 @@ are equal.
 - Emails:
   - with an IDN or non-ASCII TLD;
   - with a comment or quoted string in the domain part (`jonathan@(c)x.test`);
-  - with comments nested more than one level deep.
+  - with comments nested more than one level deep;
+  - whose local part contains a quoted string that is a JSON separator: whitespace and `[` `]` `{` `}` around at least one `:` or `,` (`jo", "smith@x.test` keeps `jo", "`; the address after it is still redacted). Such a string is not read as a quoted local part, so JSON punctuation (`": "`, `", "`) never joins a key or a previous value to an address. Quoted strings of whitespace or brackets alone (`" "`, `"[]"`) are still quoted local parts.
 - Local parts longer than 64 characters: an unquoted one keeps its characters before the last 64, and a single quoted string of more than 64 characters (or one containing a raw line break) is not matched and survives whole. A local part starting more than 256 characters before its `@` is also not matched.
 - Email addresses that OVERLAP: when one address's domain literal is also the start of the next one's local part, only the leftmost reading is redacted, and the rest only if it matches on its own.
-- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, and the two-character escapes `\t` `\n` `\r` `\f` `\b` `\/` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered). Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
+- Encoded text. `redact()` is specified over DECODED text plus ONE layer of JSON string escaping; within that layer, escaped quotes (`\"`) are read, so a quoted local part inside a JSON string is redacted, the two-character escapes `\t` `\n` `\r` `\f` each count as one gap character between digit and IBAN groups (a TAB-separated card or IBAN written by `json.dumps` is covered), and normalisation decodes `\b` (removed, as a decoded backspace is) and `\/` (read as `/`) the way a JSON decoder would. Redacting a valid JSON document yields a valid JSON document at the OUTER layer only: an inner payload of twice-encoded JSON may stop parsing. Callers MUST redact string values BEFORE serialising or encoding them (redact the decoded value, then build the JSON, HTML or URL). Not covered:
   - JSON encoded more than once (a JSON string holding JSON) is covered only for quoted local parts WITHOUT an inner escaped quote: `"jonathan\"smith"@x.test` encoded twice keeps `jonathan`. Backslash runs longer than 8 are never read as escaping.
   - `\uXXXX` and `\xXX` escapes are not decoded. In serialised text, identifier groups separated by one are not joined (an N\P written `\u00a0` between card groups; digits written `\u0661`), and an `@` or quote written `\u0040` / `\u0022` is not seen.
   - HTML entities (`&quot;` `&#34;` `&#64;` `&amp;` ...) and percent-encoding (`%22`, `%40`) are not decoded.
@@ -186,6 +189,9 @@ usually not identifiers, which reduces the usefulness of heal-log evidence:
 - **Domain literals in code-like text:** `arr@[1,2]` and `x@[i]` are redacted as
   emails. A domain literal is any bracketed text after an `@`, except one of the
   redactor's own surrogates.
+- **Lines of short numbers in JSON text:** the escapes `\t` `\n` `\r` `\f` are gap
+  characters, so `12\n34\n56\n78` becomes one `account`, exactly as the decoded lines
+  would.
 - **Glued identifiers:** identifiers glued together with no separator are redacted (no
   fragment of either survives, property-tested), but they merge into one span with one
   surrogate.
@@ -220,7 +226,9 @@ twice-encoded text.
 Properties: depth 1 (`json.dumps({"k": t})`, `json.dumps([t, "x"])`) over every covered
 local-part shape is the guarantee; depth 2 is tested only for the declared shape.
 
-**Redacted JSON stays valid JSON.** Every span is widened to whole escape sequences
+**Redacted JSON stays valid JSON — at the OUTER layer.** (An inner payload of
+twice-encoded JSON may stop parsing; that is outside the contract.) Every span is
+widened to whole escape sequences
 (`\"`, `\n`, `\\`, `\uXXXX`). A span starting at the quote of `\"` left a dangling
 backslash (`{"dom": "\[EMAIL:...]"}`), and an account starting inside `\u00e9` left
 `\u00e[ACCOUNT:...]`; both failed `json.loads`. A property checks that `json.loads`
@@ -230,8 +238,20 @@ surrogate covers its escaping backslash, so it differs from the plain address's.
 
 **JSON whitespace escapes are gap characters.** DOM table innerText is TAB-separated,
 and `json.dumps` writes a TAB as `\t`: `4111\t1111\t1111\t1111` passed fully
-unredacted with verified=True. The two-character escapes `\t` `\n` `\r` `\f` `\b` and
-`\/` now each count as one gap character (same 0–3 bound) between digit and IBAN groups.
+unredacted with verified=True. The two-character escapes `\t` `\n` `\r` `\f` now each
+count as one gap character (same 0–3 bound) between digit and IBAN groups. Two more are
+DECODED in normalisation, as a JSON decoder would and keeping the document valid JSON:
+an escaping `\b` (a backspace; decoded text loses it at no cost) is removed, and an
+escaping `\/` (PHP's `json_encode` writes every `/` so) becomes `/`. A backslash escapes
+only after an even run of backslashes, so `\\b` stays as written. The property also
+inserts backspaces anywhere in identifiers (between groups, inside email local parts and
+domains) and PHP-escapes every slash.
+
+**JSON punctuation is never a quoted local part.** `{"k": "ana@x.test"}` was redacted to
+`{"[EMAIL:…]"}`: the grammar read `k": "ana` as atext `k`, the quoted string `": "` and
+atext `ana`, so the span swallowed the key. A quoted string that is a JSON separator
+(whitespace and `[` `]` `{` `}` around at least one `:` or `,`) is no longer a quoted
+local part.
 A property puts every identifier kind, with TAB/LF/CR separators, into
 `json.dumps({"k": t})` / `json.dumps([t, "x"])` and checks that no 4-character
 fragment survives in the decoded redacted value. Over-redaction grows accordingly: lines
@@ -249,12 +269,14 @@ The email scan is driven from each `@` (`str.find`). For each `@`:
 
 | Input (1 MB unless stated) | `redact()` total | email scan alone |
 |---|---|---|
-| realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.2 s | 0.04 s / pass |
+| realistic DOM-like snapshot, 1.1 MB (HTML tags, attributes, 1,009 emails) | 1.3 s | 0.04 s / pass |
 | JSON evidence `{\"to\":\"jo smith\"@x.test\"}` repeated | 3.4 s | |
-| `a@` repeated | 2.0 s | |
+| `a@` repeated | 1.9 s | |
+| `GB12` repeated (IBAN-dense: every position starts an overlapping IBAN match) | 7.4 s | |
+| `GB12\t` repeated (IBAN groups joined by JSON TAB escapes) | 3.5 s | |
 | `(a)@` repeated | 2.6 s | |
 | `"` + 254×`a` + `"@` repeated | 5.2 s | |
-| `"a"(b)` ×10 + `@ ` repeated | 13.4 s | |
+| `"a"(b)` ×10 + `@ ` repeated | 14.3 s | |
 | `\@` repeated (backslashes: all four scans run) | 14.3 s | |
 | `\"@` repeated (backslashes: all four scans run) | 16.2 s | |
 | `"a"@` repeated | 16.5 s | 0.77 s / 100k |
