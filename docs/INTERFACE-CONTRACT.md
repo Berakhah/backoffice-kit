@@ -781,6 +781,7 @@ class Severity(StrEnum):
     INFO = "INFO"
 
 class Finding(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # contract type: unknown fields fail loudly
     id: str
     severity: Severity
     title: str
@@ -797,6 +798,20 @@ def to_sarif(findings: list[Finding], *, tool_name: str, tool_version: str) -> d
     Every result carries properties.bok_provenance = to_rail(finding.claim) and
     properties.bok_severity = the ladder value."""
 ```
+
+**As built (Task 17).** `bok_provenance` is `to_rail(claim).model_dump(mode="json")`, i.e. the §2.4
+`RailPayload` (`root`, `depth`, `inherited_caveats`). A runtime finding's location is
+`result.locations[0].logicalLocations[0].fullyQualifiedName` (never a `physicalLocation`); it is
+absent when `logical_location is None`. `partialFingerprints` is omitted when empty. `properties`
+is the caller's dict dumped in JSON mode (a `Decimal` is a string, a datetime ISO text) with the
+reserved keys `bok_severity`, `bok_provenance` and `bok_taxonomy_refs` written last, so a caller's
+`properties` can never overwrite them. Rules are de-duplicated by `id`, in first-appearance order,
+carrying `name`, `shortDescription` and `properties.taxonomyRefs`. `Finding` is `extra="forbid"`
+(§4 was silent; the contract types `Claim`, `RailNode` and the sources are all closed).
+
+**SARIF output is CLIENT data.** `bok_provenance` carries the claim chain, cell values and source
+locators included. `to_sarif()` output goes through `boundary.egress`; it never goes to a log, a
+webhook or a metric label.
 
 **The provenance travels with the finding.** v0.1's emitter dropped `Finding.claim` entirely — so
 the one artifact these products hand to an auditor was the single place the evidence chain did not
@@ -1035,6 +1050,7 @@ repo whose entire product is measuring whether claims are true.
 
 | Version | Date | Change |
 |---|---|---|
+| 0.2.16 | 2026-10-15 | **§4 `findings` — Task 17, as built. No signature changes.** `Severity`, `Finding`, `to_sarif` implemented. (1) `Finding` is `extra="forbid"` (§4 was silent; the surface selector-drift's shim already assumed). (2) `bok_provenance` is the §2.4 `RailPayload` dumped in JSON mode; `bok_severity`, `bok_provenance`, `bok_taxonomy_refs` are written after caller `properties` and cannot be overwritten. (3) Location is `locations[0].logicalLocations`, omitted when absent. (4) The export is declared CLIENT data -- egress only. (5) Tests validate against the schemastore SARIF 2.1.0 schema vendored with its sha256 (methodology.md). |
 | 0.2.15 | 2026-10-15 | **§1.3 declared gaps + §1.5 `egress` — Task 10 fix round 2. No signature changes.** (1) Both canonical lists state that JSON-number quoting needs the WHOLE normalised input to parse as one JSON document; JSON Lines, JSON embedded in HTML/text and documents `json.loads` rejects keep an unquoted surrogate. (2) `write_guarded` raises its file-name-only OSError outside the except block: the original (full paths in `filename`/`filename2`) was still reachable via `__context__`. (3) A hand-built result whose text holds a lone surrogate is refused with `SensitivityViolation`; the `UnicodeEncodeError` (whose `.object` is the forged text) never propagates or chains. (4) §1.5 re-verification cost refreshed (normalise + detect, measured). |
 | 0.2.14 | 2026-10-15 | **§1.3 `redact` + §1.5 `egress` — Task 10 fix round 1. No signature changes.** (1) egress re-verification refuses a `RedactionResult` whose text is not in normalised form and detects on normalised text: a hand-built `verified=True` over a ZWSP- or backspace-split card was written as REDACTED (genuine output is a normalisation fixpoint, property-tested). (2) A JSON number that is an identifier becomes a quoted surrogate string when the input is a valid JSON document (`{"ts": 1697000000000}` had stopped parsing); the declared gap is removed from both canonical lists and added to over-redaction. (3) egress errors name `path.name` only; OSErrors from the write are re-raised with the file name only; hand-built `failures` echo covered kinds only. (4) Declared in §1.5: the plane is caller-asserted, not derived from the path; egress proves claimed redactions, it does not require them; no image redaction proof exists. (5) §1.3 records egress's dependency on `_normalise` and `_detected_kinds`. |
 | 0.2.13 | 2026-10-14 | **§1.5 `egress` — Task 10, as built. No signature changes.** `Plane`, `guard_write`, `write_guarded` implemented. Beyond the four contracted refusals: (1) fail closed on an unknown plane or sensitivity label (`SensitivityViolation`) and on a non-bytes payload or non-`RedactionResult` redaction (`TypeError`); (2) a `RedactionResult` attached to a non-REDACTED payload is refused; (3) a REDACTED payload must be exactly `result.text` as UTF-8; (4) the guard re-runs every detector over that text (`redact._detected_kinds`, now shared with `redact()`'s own verification), so a hand-built `verified=True` is not trusted. `write_guarded` writes via a unique `mkstemp` file + fsync + `os.replace`, removing the temporary on failure. Errors carry rule, label, plane, path and kinds only; egress never logs. |

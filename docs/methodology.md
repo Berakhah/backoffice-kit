@@ -335,3 +335,12 @@ separated, adjacent and glued identifiers with Unicode separator noise.
 holds the surviving identifier. `model_dump()` includes it: a caller that persists an
 unverified result's text must treat it as `CLIENT_CONFIDENTIAL` and route it through
 egress like the original document.
+
+## Vendored SARIF schema (`tests/findings/sarif-2.1.0.json`)
+
+Used only by `tests/findings/test_sarif.py` to validate `to_sarif()` output (draft-07).
+Source: `https://json.schemastore.org/sarif-2.1.0.json` (SchemaStore, Apache-2.0; it republishes
+the OASIS SARIF 2.1.0 schema and is the URL the emitter's own `$schema` field names).
+Retrieved 2026-10-15. SHA-256 `c96eb2d311c37b0a38cbd18c52d79a68f778bbd2d831abed7412d9850740f785`
+(also in `tests/findings/sarif-2.1.0.json.sha256`; a test fails if the file drifts). Unit tests
+touch no network.
